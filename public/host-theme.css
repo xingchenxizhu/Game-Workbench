@@ -1,0 +1,68 @@
+/* 素材模块（modules/material）宿主主题：对齐工作台 V3 的深色设计变量。 */
+:root{
+  color-scheme:dark;
+  --dsw-alias-bg-layer-1:#1a212b;
+  --dsw-alias-bg-layer-2:#12161d;
+  --dsw-alias-bg-layer-3:#26303d;
+  --dsw-alias-border-l1:#4d5c72;
+  --dsw-alias-border-l2:#2c3543;
+  --dsw-alias-border-l3:#242c38;
+  --dsw-alias-label-primary:#e8edf5;
+  --dsw-alias-label-secondary:#bcc6d6;
+  --dsw-alias-label-tertiary:#8b98ab;
+  --dsw-alias-brand-primary:#7c9cff;
+  --dsw-alias-interactive-bg-hover:#253044;
+  --dsw-alias-interactive-bg-hover-solid:#2c3a52;
+  --dsw-alias-state-business-primary:#8fadff;
+  --dsw-alias-state-business-on-primary:#0e1523;
+  --dsw-alias-state-success-primary:#5fd6a8;
+  --dsw-alias-state-warning-primary:#f0b46a;
+  --dsw-alias-state-error-primary:#f2738a;
+  --dsw-alias-markdown-code-block:#0f141c;
+  --dsw-focus-ring-color:#7c9cff;
+  --dsw-focus-ring-width:2px;
+}
+*{box-sizing:border-box}
+button,input,textarea,select{font-family:inherit}
+input,textarea,select{color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1)}
+:root #skill-notice:not([hidden]){position:fixed;right:18px;bottom:18px;max-width:620px;z-index:10000;display:flex;align-items:center;gap:16px;padding:16px 20px;background:#22304a;border:1px solid #7c9cff;border-radius:12px;box-shadow:0 10px 32px #0008;font:13px/1.6 "Segoe UI","Microsoft YaHei",sans-serif;color:#e8edf5}
+:root #skill-notice button{flex:none;padding:8px 12px;background:#7c9cff;color:#0e1523;border:0;border-radius:7px;cursor:pointer}
+
+/* 工作流引导卡片 */
+.SPR_workflowGuide{margin:10px 16px;padding:12px 16px;border:1px solid #33405a;border-radius:10px;background:#171f2b;color:#d7e1f5;line-height:1.65}
+.SPR_workflowGuideHead{display:flex;gap:12px;align-items:center}
+.SPR_workflowGuide p{margin:5px 0}
+.SPR_workflowGuide summary{cursor:pointer;color:#a9c1ff}
+.SPR_workflowGuide ol{padding-left:22px;margin:8px 0}
+.SPR_startCard{margin:16px 18px;padding:22px;max-width:760px;display:grid;gap:12px;border:1px solid #33405a;border-radius:12px;background:#1a2230;min-width:0}
+.SPR_startCard h3{margin:0;font-size:19px}
+.SPR_startCard p{margin:0;line-height:1.7;color:#aebbd0}
+.SPR_startCard label{display:grid;gap:6px;min-width:0}
+.SPR_startCard input{max-width:100%;width:100%;box-sizing:border-box;padding:9px 11px;border:1px solid #33405a;border-radius:7px}
+.SPR_startCard button{justify-self:start;padding:9px 16px}
+.SPR_startHint{padding:0 18px 18px}
+@media(max-width:900px){.SPR_root>.SPR_modules{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px;padding:8px 12px}.SPR_root>.SPR_modules .SPR_module{min-width:0;width:100%;padding:8px 10px}.SPR_root>.SPR_modules .SPR_moduleHint{display:none}.SPR_headSub{display:none}.SPR_startCard{margin:12px;padding:16px}.SPR_workflowGuide{margin:8px 12px;padding:10px 12px}.SPR_tileHeader{flex-wrap:wrap}.SPR_rigPanel .SPR_modules{gap:5px}}
+
+/* 统一外观 */
+:root .SPR_btn{border-radius:7px;box-shadow:none;font-size:12px}
+:root .SPR_side{width:190px;padding:14px 10px;background:#141a23}
+:root .SPR_main{padding:22px 26px 40px}
+:root .SPR_sideTitle{font-size:10px;letter-spacing:.6px;margin-bottom:5px}
+:root .SPR_projItem{padding:10px;border-radius:7px}
+:root .SPR_steps{gap:7px;padding-bottom:16px}
+:root .SPR_step{border-radius:7px;font-size:11px;padding:7px 10px}
+:root .SPR_startCard{max-width:760px;margin:24px;padding:26px;gap:16px;border-color:#33405a;background:linear-gradient(135deg,#1d2738,#151b25);border-radius:12px}
+:root .SPR_startCard h3{font-size:19px;font-weight:500}
+:root .SPR_startCard p{font-size:12px;color:#8d9bb0}
+:root .SPR_startCard label{font-size:11px;color:#bcc6d6}
+:root .SPR_startCard input{background:#141a23;border-color:#33405a;color:#dbe4f1;padding:10px}
+:root .SPR_workflowGuide{background:#171f2b;border-color:#33405a;border-radius:8px;padding:10px 14px;color:#aebbd0;font-size:11px}
+:root .SPR_workflowGuide summary{color:#9db6ff}
+:root .SPR_expTag{color:#c6bd93;border-color:#6f6748;background:#3a3a2444;font-size:9px}
+:root #skill-notice:not([hidden]){background:#233352;border-color:#7c9cff;font-size:12px;max-width:540px}
+:root #skill-notice button{background:#7c9cff;color:#0e1523}
+:root.workbench-embedded body,:root.workbench-embedded #root{background:#12161d;color:#e8edf5}
+:root.workbench-embedded .SPR_root{font-size:12px;background:#12161d}
+:root.workbench-embedded .SPR_root>.SPR_head h2,:root.workbench-embedded .SPR_root>.SPR_head .SPR_headSub{display:none}
+@media(max-width:900px){:root .SPR_side{width:158px;padding:10px 7px}:root .SPR_main{padding:16px}:root .SPR_startCard{margin:16px;padding:20px}:root .SPR_step{font-size:10px}}
+@media(max-width:520px){:root .SPR_body{flex-direction:column}:root .SPR_side{width:100%;max-height:150px;border-right:0;border-bottom:1px solid var(--dsw-alias-border-l2)}:root .SPR_main{overflow:visible;padding:14px}:root .SPR_startCard{margin:12px;padding:17px}:root .SPR_startCard h3{font-size:17px}:root .SPR_workflowGuide{margin:10px 12px}}

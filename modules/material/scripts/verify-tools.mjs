@@ -1,0 +1,940 @@
+/**
+ * 对话调用面自检：不需要浏览器、不联网、不花钱。
+ *
+ *   node scripts/verify-tools.mjs
+ *
+ * 钉住三件事：
+ *
+ * ① **工具面**：`ctx.tools` 上只注册 1 个 `game_material`，schema 合法（DSH 只认
+ *    type/oneOf/properties/required/additionalProperties/items/enum/const 这个子集），
+ *    常驻 schema + 系统提示词 ≤6,000 B；`guide` 的 `methods` 目录**覆盖插件的每一个
+ *    远程方法**——「所有功能都能通过对话调用」这句话靠它成立。
+ *
+ * ② **固定流程**：`action:"intake"` 必须先问用户关键参数与审核模式。
+ *    这里直接调工具的 execute，断言：
+ *      - 没配 Key 时给出 blocker；
+ *      - 缺源图 / 缺提示词 / 缺素材时出现在 questions 里；
+ *      - 已经有的事实（源图、提示词、素材）不再问；
+ *      - reviewModeQuestion 一定是 auto / manual 两个选项。
+ *
+ * ③ **深链接**：宿主 links.ts 与浏览器半区 client.ts 是两份实现（经典脚本不能
+ *    import），所以用文本契约把参数名、模块名、面板 id 钉成一致；再验证
+ *    链接 → 意图 → 链接 的往返一致。
+ */
+
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
+
+const HOME = await mkdtemp(join(tmpdir(), "dsh-gmm-tools-"));
+process.env.DSH_HOME = HOME;
+
+const { Context } = await import("@deepseek-ai/cordis");
+const plugin = await import("../lib/index.js");
+const links = await import("../lib/links.js");
+const { METHODS } = await import("../lib/wire.js");
+const { encodePng } = await import("../lib/png.js");
+const { moduleForId, METHOD_MODULE, SHARED_TOOL_METHODS } = await import("../lib/tools.js");
+
+const failures = [];
+let checks = 0;
+function check(name, ok, detail) {
+  checks++;
+  console.log(`  ${ok ? "✓" : "✗"} ${name}${detail === undefined ? "" : ` — ${detail}`}`);
+  if (!ok) failures.push(name);
+}
+
+/** DSH 支持的关键字子集（见 @deepseek-ai/dsh-tools 的 checkSchemaNode）。 */
+const SCHEMA_KEYWORDS = new Set([
+  "type",
+  "oneOf",
+  "properties",
+  "required",
+  "additionalProperties",
+  "items",
+  "enum",
+  "const",
+  "description",
+  "title",
+  "default",
+  "examples"
+]);
+const SCHEMA_TYPES = ["object", "array", "string", "number", "integer", "boolean", "null"];
+
+/** 递归校验 schema 只用了受支持的子集（dsh-tools 会在注册时抛错，这里提前抓）。 */
+function validateSchema(schema, path, problems) {
+  if (schema === null || typeof schema !== "object" || Array.isArray(schema)) {
+    problems.push(`${path} 不是对象`);
+    return;
+  }
+  for (const key of Object.keys(schema)) {
+    if (!SCHEMA_KEYWORDS.has(key)) problems.push(`${path}.${key} 不是受支持的关键字`);
+  }
+  if (Object.hasOwn(schema, "oneOf")) {
+    if (!Array.isArray(schema.oneOf) || schema.oneOf.length < 2) problems.push(`${path}.oneOf 至少两个`);
+    else schema.oneOf.forEach((child, index) => validateSchema(child, `${path}.oneOf[${index}]`, problems));
+    return;
+  }
+  if (!Object.hasOwn(schema, "type")) return;
+  if (!SCHEMA_TYPES.includes(schema.type)) {
+    problems.push(`${path}.type 非法：${schema.type}`);
+    return;
+  }
+  if (schema.type === "object") {
+    if (Object.hasOwn(schema, "required") && !Array.isArray(schema.required)) problems.push(`${path}.required 必须是数组`);
+    for (const [name, child] of Object.entries(schema.properties ?? {})) {
+      validateSchema(child, `${path}.properties.${name}`, problems);
+    }
+  }
+  if (schema.type === "array" && schema.items !== undefined) validateSchema(schema.items, `${path}.items`, problems);
+  if (Object.hasOwn(schema, "enum") && (!Array.isArray(schema.enum) || schema.enum.length === 0)) {
+    problems.push(`${path}.enum 必须是非空数组`);
+  }
+}
+
+/**
+ * 找出「无损过不了 JSON」的值：`undefined` 的键、`NaN` / `Infinity` / `-0`。
+ *
+ * DSH（typert 0.1.7+）对工具返回值做这道校验：返回值里只要有**一个**这样的
+ * 值，整次工具调用直接失败，用户只看到一句
+ * `tool "…" returned invalid output: value is not lossless JSON`——而产物好端端
+ * 躺在磁盘上，看着像插件装坏了。项目还没跑完时 `status` / `review` / `wait` /
+ * `call getProject` 会一起中招（可选字段按 `file: node.file` 写，键在值是 undefined）。
+ *
+ * 注意 **`JSON.stringify` 看不出这类问题**：它自己就会把 undefined 抹掉，
+ * 所以「断言 stringify 之后没有 undefined」是永远为真的假检查——下面第 5 节
+ * 那条假检查就是被这个坑过去的，已换成真的审计。
+ */
+function losslessProblems(value, path = "$", out = []) {
+  if (value === undefined) {
+    out.push(`${path} = undefined`);
+    return out;
+  }
+  if (typeof value === "number") {
+    if (Number.isNaN(value)) out.push(`${path} = NaN`);
+    else if (!Number.isFinite(value)) out.push(`${path} = ${value}`);
+    else if (Object.is(value, -0)) out.push(`${path} = -0`);
+    return out;
+  }
+  if (value === null || typeof value !== "object") return out;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      if (!Object.hasOwn(value, i)) out.push(`${path}[${i}] = 空洞`);
+      else losslessProblems(value[i], `${path}[${i}]`, out);
+    }
+    return out;
+  }
+  for (const key of Object.keys(value)) losslessProblems(value[key], `${path}.${key}`, out);
+  return out;
+}
+
+async function main() {
+  console.log(`临时 DSH_HOME: ${HOME}\n`);
+
+  // ── 1. 挂载：提供 typert / webServer / tools / systemPrompt ──────────────
+  console.log("1) 挂载插件并捕获工具面");
+  const ctx = new Context();
+  const captured = { manifest: null, routes: [], tools: [], sections: [] };
+  ctx.provide("typert", {
+    register: (manifest) => {
+      captured.manifest = manifest;
+      return () => {};
+    }
+  });
+  ctx.provide("webServer", {
+    register: (route) => {
+      captured.routes.push(route);
+      return () => {};
+    }
+  });
+  ctx.provide("tools", {
+    register: (definition) => {
+      captured.tools.push(definition);
+
+      return () => {};
+    }
+  });
+  ctx.provide("systemPrompt", {
+    section: (section) => {
+      captured.sections.push(section);
+      return () => {};
+    }
+  });
+  plugin.apply(ctx);
+  const studio = ctx.get("gameStudio");
+
+  const names = captured.tools.map((tool) => tool.name);
+  check(
+    "只注册 1 个 game_material 工具",
+    captured.tools.length === 1 && names[0] === "game_material",
+    names.join("、")
+  );
+
+  const problems = [];
+  for (const tool of captured.tools) {
+    validateSchema(tool.parameters, `${tool.name}.parameters`, problems);
+    validateSchema(tool.output?.schema, `${tool.name}.output.schema`, problems);
+    if (typeof tool.output?.render !== "function") problems.push(`${tool.name}.output.render 不是函数`);
+    if (typeof tool.execute !== "function") problems.push(`${tool.name}.execute 不是函数`);
+  }
+  check("所有工具 schema 只用受支持的关键字子集", problems.length === 0, problems.slice(0, 3).join("；"));
+  check(
+    "每个工具都有参数描述",
+    captured.tools.every((tool) => Object.values(tool.parameters.properties ?? {}).every((node) => typeof node.description === "string")),
+    ""
+  );
+
+  // ── 1b. 常驻上下文预算 ────────────────────────────────────────────────
+  //
+  // 工具定义 + 系统提示词每次请求都会进上下文。8 个工具 + 长描述曾经是
+  // 49,393 B；这里把「常驻部分」钉在 6,000 B 以内，详细手册只能走 guide。
+  const onlyTool = captured.tools[0];
+  const surfaceBytes =
+    Buffer.byteLength(JSON.stringify({ name: onlyTool.name, description: onlyTool.description, parameters: onlyTool.parameters })) +
+    Buffer.byteLength(captured.sections[0]?.text ?? "");
+  check("常驻工具面 ≤ 6000 B", surfaceBytes <= 6000, `${surfaceBytes} B`);
+  check("工具描述 ≤ 1200 B", Buffer.byteLength(onlyTool.description) <= 1200, `${Buffer.byteLength(onlyTool.description)} B`);
+  check(
+    "action 覆盖 9 个动作",
+    ["guide", "intake", "call", "status", "wait", "review", "approve", "reviewMode", "upload"].every((action) =>
+      (onlyTool.parameters.properties.action.enum ?? []).includes(action)
+    ),
+    (onlyTool.parameters.properties.action.enum ?? []).join("、")
+  );
+
+  // ── 2. guide 方法目录覆盖每一个远程方法 ──────────────────────────────
+  console.log("\n2) guide 的方法覆盖");
+  const clientOnly = METHODS.filter((spec) => spec.clientOnly === true).map((spec) => spec.method);
+  const exposed = METHODS.filter((spec) => spec.clientOnly !== true).map((spec) => spec.method);
+  const methodGuide = await onlyTool.execute({ action: "guide", topic: "methods" }, { signal: undefined });
+  check(
+    "methods 目录覆盖全部非 clientOnly 方法",
+    exposed.every((method) => methodGuide.text.includes(method)),
+    `目录 ${exposed.filter((method) => methodGuide.text.includes(method)).length} / 期望 ${exposed.length}`
+  );
+  check(
+    "methods 目录不暴露 clientOnly 方法",
+    clientOnly.every((method) => !methodGuide.text.includes(method)),
+    clientOnly.join("、")
+  );
+  check("reportClientOrigin 被标成 clientOnly", clientOnly.includes("reportClientOrigin"), clientOnly.join("、"));
+  check("setReviewMode 出现在方法目录", methodGuide.text.includes("setReviewMode"));
+
+  for (const module of links.STUDIO_MODULES) {
+    const guide = await onlyTool.execute({ action: "guide", topic: module }, { signal: undefined });
+    const expected = exposed.filter((method) => METHOD_MODULE[method] === module);
+    check(
+      `${module} 手册覆盖本模块方法`,
+      expected.every((method) => guide.text.includes(method)),
+      `${expected.filter((method) => guide.text.includes(method)).length} / ${expected.length}`
+    );
+  }
+  const overview = await onlyTool.execute({ action: "guide", topic: "overview" }, { signal: undefined });
+  check("overview 列出全部可见模块", links.STUDIO_MODULES.every((module) => overview.text.includes(module)));
+
+  // ── 3. 远程 payload schema 必须放行界面用到的每个字段 ───────────────────
+  //
+  // 这一段是为一个真实存在的坑加的：工具直接调网关方法（同进程），而界面走
+  // Typert 远程网关，payload 会先过 wire.ts 的 zod schema。**schema 里漏声明
+  // 一个字段，界面上的按钮就会静默失效**，而工具测试、宿主冒烟测试都绕过
+  // 了 schema，一个都不会红。这里直接拿 schema 过一遍。
+  console.log("\n3) 远程 payload schema");
+  const specOf = (method) => METHODS.find((entry) => entry.method === method);
+  const saveImage = specOf("saveImageJob").payload.parse({ jobId: "i1", approved: true, index: 0 });
+  check("saveImageJob 保留 approved / index", saveImage.approved === true && saveImage.index === 0, JSON.stringify(saveImage));
+  const saveSequence = specOf("saveSequenceJob").payload.parse({ jobId: "s1", approved: true, step: "frames" });
+  check("saveSequenceJob 保留 approved / step", saveSequence.approved === true && saveSequence.step === "frames", JSON.stringify(saveSequence));
+  const reviewMode = specOf("setReviewMode").payload.parse({ id: "p1", module: "sprite", reviewMode: "manual" });
+  check("setReviewMode payload 完整", reviewMode.reviewMode === "manual" && reviewMode.module === "sprite", JSON.stringify(reviewMode));
+  const originPayload = specOf("reportClientOrigin").payload.parse({ origin: "http://127.0.0.1:43120" });
+  check("reportClientOrigin payload 完整", originPayload.origin === "http://127.0.0.1:43120", JSON.stringify(originPayload));
+  // DSH 0.2.1 的 --public-url 路径前缀：path 不在 schema 里会被静默丢掉。
+  const originPathPayload = specOf("reportClientOrigin").payload.parse({ origin: "https://game.example", path: "/prefix" });
+  check("reportClientOrigin 保留 path（路径前缀）", originPathPayload.path === "/prefix", JSON.stringify(originPathPayload));
+  const prompts = specOf("savePrompts").payload.parse({ projectId: "p1", suffix: "不要出现文字" });
+  check("savePrompts 保留 suffix", prompts.suffix === "不要出现文字", JSON.stringify(prompts));
+
+  // ── 4. 准备一个真实项目 / 任务，供 intake 与 review 使用 ────────────────
+  console.log("\n4) 固定流程第 0 步：先问再动手");
+  const tool = (_name) => captured.tools[0];
+  /** 旧测试仍按 `game_material_status` 这种名字调用；这里统一映射到 action。 */
+  const actionOf = (name) => (name === "game_material" ? "" : name.replace(/^game_material_/, ""));
+  const inputFor = (name, args) => (actionOf(name) === "" ? args : { action: actionOf(name), ...args });
+  /**
+   * 每次工具调用都顺手做一遍「无损 JSON」审计：DSH 会在工具边界做这道校验，
+   * 不过就整次调用失败。审计放在这里，是为了让**后面每一个 run() 用的用例**
+   * 都自动被盖住，新增工具/字段时不需要再补断言。
+   */
+  const losslessAudit = [];
+  const run = async (name, args) => {
+    const value = await tool(name).execute(inputFor(name, args), { signal: undefined });
+    const problems = losslessProblems(value);
+    if (problems.length > 0) losslessAudit.push(`${name} → ${problems.slice(0, 4).join("、")}`);
+    return value;
+  };
+
+  const emptyIntake = await run("game_material_intake", { module: "sprite" });
+  check("没配 Key 时给出 blocker", emptyIntake.blockers.some((text) => text.includes("火山方舟")), emptyIntake.blockers.join("；"));
+  check(
+    "必问审核模式，且只有 auto / manual 两个选项",
+    Array.isArray(emptyIntake.reviewModeQuestion?.options) &&
+      emptyIntake.reviewModeQuestion.options.map((option) => option.value).join(",") === "auto,manual",
+    JSON.stringify(emptyIntake.reviewModeQuestion?.options?.map((option) => option.value))
+  );
+  check(
+    "新目标时问「新建还是继续」",
+    emptyIntake.questions.some((question) => question.key === "target")
+  );
+  check(
+    "缺源图时问源图",
+    emptyIntake.questions.some((question) => question.key === "source")
+  );
+  check(
+    "必问阶段①的生成方式（转圈截帧 / 逐方向生图）",
+    emptyIntake.questions.some((question) => question.key === "generateMode" && /转圈截帧/.test(question.question)),
+    emptyIntake.questions.map((question) => question.key).join("、")
+  );
+  check(
+    "已知默认生成方式时进 known",
+    emptyIntake.known["阶段1两种生成方式"] !== undefined || emptyIntake.known["阶段1生成方式"] !== undefined,
+    Object.keys(emptyIntake.known).join("、")
+  );
+
+  // 配置一个假 Key，blocker 应当消失。
+  await studio.saveConfig({ arkApiKey: "sk-verify-tools", minimaxApiKey: "mm-verify-tools" });
+  const withKey = await run("game_material_intake", { module: "sprite" });
+  check("配好 Key 后不再报 blocker", withKey.blockers.length === 0, withKey.blockers.join("；"));
+
+  const { projectId } = await studio.createProject({ name: "对话调用自检项目" });
+  const withProject = await run("game_material_intake", { module: "sprite", id: projectId });
+  check("已有项目时不再问「新建还是继续」", !withProject.questions.some((question) => question.key === "target"));
+  check("项目还没有源图，仍然要问源图", withProject.questions.some((question) => question.key === "source"));
+
+  // 上传一张源图后，「源图」应当进入 known 而不是 questions。
+  const png = encodePng(Buffer.alloc(4 * 4 * 4, 200), 4, 4);
+  const sourcePath = join(HOME, "hero.png");
+  await writeFile(sourcePath, png);
+  await run("game_material_upload", { module: "sprite", id: projectId, kind: "source", path: sourcePath });
+  const afterUpload = await run("game_material_intake", { module: "sprite", id: projectId });
+  check("上传源图后不再问源图", !afterUpload.questions.some((question) => question.key === "source"));
+  check("源图进入 known", typeof afterUpload.known.源图 === "string", String(afterUpload.known.源图));
+
+  // 图片模块：提示词为空 → 必问；填好 → 不问。
+  const { jobId: imageId } = await studio.createImageJob({ name: "自检图片任务" });
+  const imageIntake = await run("game_material_intake", { module: "image", id: imageId });
+  check("图片任务缺提示词时必问", imageIntake.questions.some((question) => question.key === "prompt"));
+  await studio.saveImageJob({ jobId: imageId, prompt: "一只橘色的方块" });
+  const imageIntake2 = await run("game_material_intake", { module: "image", id: imageId });
+  check("填好提示词后不再问", !imageIntake2.questions.some((question) => question.key === "prompt"));
+
+  // 序列帧模块：两种输入模式互斥，必须问。
+  const { jobId: seqId } = await studio.createSequenceJob({ name: "自检序列帧任务" });
+  const seqIntake = await run("game_material_intake", { module: "sequence", id: seqId });
+  check("序列帧必问输入模式", seqIntake.questions.some((question) => question.key === "mode"));
+  check("序列帧必问素材", seqIntake.questions.some((question) => question.key === "material"));
+  check("序列帧必问提示词", seqIntake.questions.some((question) => question.key === "prompt"));
+  check(
+    "问过的不再重复问",
+    (await run("game_material_intake", { module: "sequence", id: seqId, told: ["mode"] })).questions.every(
+      (question) => question.key !== "mode"
+    )
+  );
+
+  // ── 4. 审核模式：记录、读取、状态里带出来 ──────────────────────────────
+  console.log("\n4) 审核模式（固定流程必问项）");
+  const modeResult = await run("game_material_reviewMode", { module: "sprite", id: projectId, reviewMode: "manual" });
+  check("工具能写审核模式", modeResult.reviewMode === "manual", JSON.stringify(modeResult));
+  const statusManual = await run("game_material_status", { module: "sprite", id: projectId });
+  check("status 里带出审核模式", statusManual.reviewMode === "manual", String(statusManual.reviewMode));
+  const reIntake = await run("game_material_intake", { module: "sprite", id: projectId });
+  check("已经定过审核模式就进 known", reIntake.known.审核模式 === "manual", String(reIntake.known.审核模式));
+
+  // ── 5. status / review / approve / wait 的实际结果形状 ──────────────────
+  console.log("\n5) 验收链路");
+  const list = await run("game_material_status", {});
+  check("不给 id 时列出三个模块的清单", Array.isArray(list.projects) && Array.isArray(list.imageJobs) && Array.isArray(list.sequenceJobs));
+  check("清单里带三条模块深链接", typeof list.links?.sprite === "string" && list.links.sprite.includes("module=sprite"));
+
+  const review = await run("game_material_review", { module: "sprite", id: projectId, stage: "images" });
+  check("验收包只含指定阶段", review.stages.length === 1 && review.stages[0].stage === "images");
+  check("验收包有 8 个方位", review.stages[0].cells.length === 8);
+  check("验收包给出 openUrl", typeof review.openUrl === "string" && review.openUrl.includes(`project=${projectId}`));
+  check("验收包给出建议动作", Array.isArray(review.nextActions) && review.nextActions.length > 0);
+  check("方位过滤生效", (await run("game_material_review", { module: "sprite", id: projectId, stage: "images", direction: "front" })).stages[0].cells.length === 1);
+
+  // 造一个假的 ready 产物，验证 approve 与 wait 的行为。
+  const { patchProject } = await import("../lib/store.js");
+  await patchProject(projectId, (project) => {
+    project.images.front = { status: "ready", file: "images/front.png", approved: false };
+  });
+  const approve = await run("game_material_approve", { module: "sprite", id: projectId, stage: "images", key: "front", approved: true });
+  check("approve 回执带上标的位置", approve.approved === true && approve.key === "front", JSON.stringify(approve));
+  check("approve 之后 getProject 能看到已通过", (await studio.getProject({ projectId })).images.front.approved === true);
+  check("approve 之后验收包里是已通过", (await run("game_material_review", { id: projectId, stage: "images", direction: "front" })).stages[0].cells[0].approved === true);
+
+  // ── 转圈截帧：状态 / 验收 / 下一步都要说到点上 ──────────────────────────
+  // 阶段①默认走这条路，而它的下一步与逐方向生图完全不同（runTurnVideo /
+  // runTurnFrames / setTurnPick），提示写错模型就会照着 runImages 一路跑偏。
+  await patchProject(projectId, (project) => {
+    project.imageMode = "turn";
+    project.turn.video = { status: "ready", file: "videos/turn.mp4", approved: false, firstFrame: "source/hero.png" };
+    project.turn.frames = {
+      status: "ready",
+      frames: Array.from({ length: 16 }, (_, i) => `turn/frames/f${String(i).padStart(2, "0")}.png`),
+      times: Array.from({ length: 16 }, (_, i) => (i * 2) / 16),
+      raw: "turn/raw.bin",
+      rawWidth: 120,
+      rawHeight: 120,
+      rawFrameCount: 16,
+      duration: 2,
+      picks: { front: 0, downLeft: 2, downRight: 14, upLeft: 6, upRight: 10, back: 8, left: 4, right: 12 },
+      strip: "turn/strip.png",
+      approved: false
+    };
+    project.images = Object.fromEntries(
+      Object.keys(project.images).map((key) => [key, { status: "ready", file: `images/${key}.png`, approved: false }])
+    );
+  });
+  const turnStatus = await run("game_material_status", { module: "sprite", id: projectId });
+  const turnSnapshot = await studio.getProject({ projectId });
+  const turnReview = await run("game_material_review", { module: "sprite", id: projectId, stage: "images" });
+  check(
+    "转圈模式的状态里带出生成方式与候选帧",
+    turnStatus.imageMode === "turn" && turnStatus.turn?.frameCount === 16 && turnStatus.stages[0].cells.length === 8,
+    JSON.stringify({ mode: turnStatus.imageMode, frames: turnStatus.turn?.frameCount })
+  );
+  check(
+    "验收包的八张方向图带上「第几帧」",
+    turnReview.stages[0].cells.every((cell) => typeof cell.frameIndex === "number" && cell.frameTotal === 16),
+    JSON.stringify(turnReview.stages[0].cells[0])
+  );
+  check(
+    "验收包带上转圈视频与缩略条带（能点开看圈转得对不对）",
+    typeof turnReview.turn?.videoUrl === "string" && turnReview.turn.videoUrl.includes("videos/turn.mp4") &&
+      typeof turnReview.turn?.stripUrl === "string" && turnReview.turn.stripUrl.includes("turn/strip.png"),
+    JSON.stringify({ video: turnReview.turn?.videoUrl, strip: turnReview.turn?.stripUrl })
+  );
+  check("验收包带上八个截帧位置", turnReview.turnPicks?.front === 0 && turnReview.turnPicks?.back === 8, JSON.stringify(turnReview.turnPicks));
+  // 这里原来断言的是 `!JSON.stringify(x).includes("undefined")`——永远为真：
+  // stringify 自己就把 undefined 抹掉了，正是这个假检查让「工具输出带 undefined、
+  // 新版 DSH 直接拒绝整次调用」的 bug 溜了过去。真检查见下一节第 6.5 条的审计。
+  // 八张图还没切出来时，建议动作必须指向转圈那条路（不是 runImages）。
+  await patchProject(projectId, (project) => {
+    project.images.back = { status: "empty" };
+    project.images.left = { status: "empty" };
+    project.turn.video.status = "ready";
+  });
+  const turnNext = (await run("game_material_review", { module: "sprite", id: projectId })).nextActions.join(" | ");
+  check("转圈模式下建议动作指向 runTurnFrames", /runTurnFrames/.test(turnNext) && !/method:'runImages'/.test(turnNext), turnNext.slice(0, 160));
+  // 视频还没生成时，第一步必须是 runTurnVideo（一次计费的视频调用），不是生图。
+  await patchProject(projectId, (project) => {
+    project.turn.video = { status: "empty", approved: false };
+  });
+  const turnNextFresh = (await run("game_material_review", { module: "sprite", id: projectId })).nextActions.join(" | ");
+  check("没有转圈视频时建议动作指向 runTurnVideo", /runTurnVideo/.test(turnNextFresh), turnNextFresh.slice(0, 160));
+
+  const waited = await run("game_material_wait", { id: projectId, timeoutSeconds: 1 });
+  check("没有任务在跑时 wait 立刻返回 settled", waited.settled === true && waited.timedOut === false, JSON.stringify({ settled: waited.settled, elapsedMs: waited.elapsedMs }));
+  check("wait 结果里带 openUrl", typeof waited.openUrl === "string");
+
+  const imageApproveEmpty = await tool("game_material")
+    .execute({ action: "approve", module: "image", id: imageId, approved: true }, {})
+    .then(() => null, (error) => String(error?.message ?? error));
+  check("空任务打通过给出可读错误", imageApproveEmpty !== null && imageApproveEmpty.includes("还没有产物"), String(imageApproveEmpty));
+  await studio.addImageItem({ jobId: imageId, name: "one.png", data: png.toString("base64") });
+  const imageApprove = await run("game_material_approve", { module: "image", id: imageId, approved: true });
+  check("图片任务整体打通过不报错", imageApprove.approved === true, JSON.stringify(imageApprove));
+  check("图片任务打通过落盘", (await studio.getImageJob({ jobId: imageId })).items[0].approved === true);
+  const seqApprove = await run("game_material_approve", { module: "sequence", id: seqId, step: "video", approved: true });
+  check("序列帧按步骤打通过不报错", seqApprove.step === "video", JSON.stringify(seqApprove));
+
+  // ── 5.5 骨骼动画的 status / review 渲染 ────────────────────────────────
+  //
+  // 这一段是为两个真实炸掉的调用加的：
+  //   · game_material_review 的渲染器一律按「阶段里有 cells」迭代，而骨骼动画的
+  //     阶段**没有 cells**（产物是每阶段固定的几个 URL），整次调用直接以
+  //     "stage.cells is not iterable" 失败——用户在对话里连验收包都拿不到；
+  //   · status / wait 按 ready/total/running 渲染，骨骼动画的阶段只有 status，
+  //     印出来是一串 `ready undefined/undefined`。
+  // 两个都只在骨骼动画模块出现，其他模块的测试一条都不会红。
+  console.log("\n5.5) 骨骼动画的 status / review 渲染");
+  const { jobId: rigId } = await studio.createRigJob({ name: "自检骨骼动画任务" });
+  await run("game_material_upload", { module: "rig", id: rigId, kind: "source", path: sourcePath });
+  await run("game_material_upload", { module: "rig", id: rigId, kind: "part", path: sourcePath, name: "head" });
+
+  // 渲染器的签名是 render(args, value)，返回的是文本块数组（与 DSH 一致）。
+  const renderText = (name, args, value) =>
+    (tool(name).output.render(inputFor(name, args), value) ?? []).map((block) => block?.text ?? "").join("\n");
+
+  const rigStatus = await run("game_material_status", { module: "rig", id: rigId });
+  const rigStatusText = renderText("game_material_status", { module: "rig", id: rigId }, rigStatus);
+  check("骨骼动画 status 渲染没有 undefined", !rigStatusText.includes("undefined"), rigStatusText.slice(0, 140).replace(/\n/g, " | "));
+  check(
+    "骨骼动画 status 列出四个阶段",
+    ["① 拆件", "② 装配定位", "③ 骨骼与动画", "④ 图集"].every((title) => rigStatusText.includes(title)),
+    ""
+  );
+
+  const rigReview = await run("game_material_review", { module: "rig", id: rigId });
+  let rigReviewText = "";
+  let rigReviewError = null;
+  try {
+    rigReviewText = renderText("game_material_review", { module: "rig", id: rigId }, rigReview);
+  } catch (error) {
+    rigReviewError = String(error?.message ?? error);
+  }
+  check("骨骼动画 review 渲染不报错", rigReviewError === null, String(rigReviewError));
+  check("骨骼动画 review 没有 undefined", !rigReviewText.includes("undefined"), rigReviewText.slice(0, 140).replace(/\n/g, " | "));
+  check(
+    "骨骼动画 review 里能点到产物 URL",
+    (rigReviewText.match(/https?:\/\//g) ?? []).length >= 1,
+    rigReviewText.split("\n").filter((line) => /https?:\/\//.test(line)).length + " 条"
+  );
+
+  // ── 6. 错误要有可读信息 ────────────────────────────────────────────────
+  console.log("\n6) 错误路径");
+  const expectThrow = async (name, fn, needle) => {
+    try {
+      await fn();
+      check(name, false, "预期抛错但没有");
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      check(name, message.includes(needle), message.slice(0, 90));
+    }
+  };
+  await expectThrow("未知方法被拒绝", () => run("game_material_call", { method: "nope" }), "未知方法");
+  await expectThrow("缺 payload 被拒绝", () => run("game_material_call", { method: "getProject" }), "payload");
+  await expectThrow("上传不支持的种类被拒绝", () => run("game_material_upload", { module: "sprite", id: projectId, kind: "ref", path: sourcePath }), "不支持 kind");
+  await expectThrow("不存在的文件被拒绝", () => run("game_material_upload", { module: "sprite", id: projectId, kind: "source", path: join(HOME, "nope.png") }), "读不到文件");
+  await expectThrow("拿不是图片的文件当图片被拒绝", async () => {
+    const textPath = join(HOME, "not-an-image.png");
+    await writeFile(textPath, "definitely not a png");
+    return run("game_material_upload", { module: "sprite", id: projectId, kind: "source", path: textPath });
+  }, "无法识别的图片格式");
+  await expectThrow("找不到的目标给出可读错误", () => run("game_material_status", { id: "pdeadbeef" }), "找不到");
+
+  // 本地自选视频：对话面也要能走（kind=video + key 指定槽位）。
+  // 槽位**必须显式给**：猜一个（例如默认转圈）会把一段行走视频塞到错误的位置，
+  // 而产物看起来「成功了」——只能等后面几步出错。
+  {
+    const videoPath = join(HOME, "local-walk.mp4");
+    await writeFile(
+      videoPath,
+      Buffer.concat([Buffer.from([0, 0, 0, 0x18]), Buffer.from("ftypmp42", "ascii"), Buffer.alloc(24)])
+    );
+    await expectThrow(
+      "本地视频：不给 key 直接拒绝（不猜槽位）",
+      () => run("game_material_upload", { module: "sprite", id: projectId, kind: "video", path: videoPath }),
+      "必须给 key"
+    );
+    await expectThrow(
+      "本地视频：槽位名写错直接拒绝",
+      () => run("game_material_upload", { module: "sprite", id: projectId, kind: "video", key: "frontt", path: videoPath }),
+      "必须给 key"
+    );
+    await expectThrow(
+      "本地视频：拿图片文件冒充会被文件头嗅探拦下",
+      () => run("game_material_upload", { module: "sprite", id: projectId, kind: "video", key: "back", path: sourcePath }),
+      "无法识别的视频格式"
+    );
+    const uploaded = await run("game_material_upload", { module: "sprite", id: projectId, kind: "video", key: "front", path: videoPath });
+    check(
+      "本地视频能通过对话面上传到指定方向",
+      uploaded.key === "front" && uploaded.video?.file === "videos/front.mp4",
+      JSON.stringify(uploaded.video ?? uploaded)
+    );
+    check("返回值里带着槽位（模型据此知道落到哪一格）", uploaded.kind === "video" && uploaded.key === "front", JSON.stringify({ kind: uploaded.kind, key: uploaded.key }));
+    const uploadText = renderText("game_material_upload", {}, uploaded);
+    check("渲染文本里点明了槽位", uploadText.includes("槽位 front"), uploadText.slice(0, 140));
+  }
+
+  // ── 6.5 工具返回值必须能无损过 JSON ────────────────────────────────────
+  // 新版 DSH 在工具边界做这道校验，不过就整次调用失败（只有一句
+  // `value is not lossless JSON`，用户看不出是哪个字段）。跑过的每一次 run()
+  // 都在这里汇总，所以「项目空着 / 只跑了一半」这些最容易漏 undefined 的状态
+  // 也被盖住了。
+  console.log("\n6.5) 工具返回值的无损 JSON 审计");
+  check("所有工具调用的返回值都能无损过 JSON", losslessAudit.length === 0, losslessAudit.slice(0, 3).join(" | "));
+
+  // ── 6.7 功能管理：被隐藏的模块，工具面也必须拒绝 ────────────────────────
+  //
+  // 「隐藏」如果只做在界面上等于没做：模型看不见页签，照样能调 runTileItems
+  // 真实计费。这一段钉住宿主那一半闸门。
+  console.log("\n6.7) 功能管理（隐藏的模块对模型不可用）");
+  const unclassified = exposed.filter((method) => METHOD_MODULE[method] === undefined && !SHARED_TOOL_METHODS.has(method));
+  check("每个工具方法都归了模块（或明确标为共享）", unclassified.length === 0, unclassified.join("、"));
+  const knownMethods = new Set([...Object.keys(METHOD_MODULE), ...SHARED_TOOL_METHODS]);
+  check("归类表里没有多余 / 打错的方法名", [...knownMethods].every((method) => exposed.includes(method)), [...knownMethods].filter((method) => !exposed.includes(method)).join("、"));
+
+  const hiddenConfig = await studio.saveConfig({ hiddenModules: ["tile", "rig", "nope"] });
+  check(
+    "hiddenModules 收敛成合法子集并按固定顺序排列",
+    JSON.stringify(hiddenConfig.hiddenModules) === JSON.stringify(["rig", "tile"]),
+    JSON.stringify(hiddenConfig.hiddenModules)
+  );
+  check("读回来的配置里有 hiddenModules", Array.isArray((await studio.getConfig()).hiddenModules));
+
+  await expectThrow("隐藏模块的远程方法被拒绝", () => run("game_material_call", { method: "listTileProjects" }), "已被用户");
+  await expectThrow("隐藏模块（骨骼）同样被拒绝", () => run("game_material_call", { method: "runRigSheet", payload: { jobId: "r1" } }), "隐藏");
+  await expectThrow("setReviewMode 也按 payload 里的模块拦", () => run("game_material_call", { method: "setReviewMode", payload: { module: "tile", id: "t1", reviewMode: "auto" } }), "隐藏");
+  await expectThrow(
+    "工具面不允许改功能可见性（否则模型能自己放出来）",
+    () => run("game_material_call", { method: "saveConfig", payload: { hiddenModules: [] } }),
+    "不允许"
+  );
+  const visibleCall = await run("game_material_call", { method: "listProjects" });
+  check("没被隐藏的模块照常可用", visibleCall.ok === true, JSON.stringify(visibleCall).slice(0, 60));
+
+  await expectThrow("intake 对隐藏模块直接拒绝", () => run("game_material_intake", { module: "tile" }), "隐藏");
+  await expectThrow("upload 对隐藏模块直接拒绝", () => run("game_material_upload", { module: "rig", id: "r1", kind: "source", path: sourcePath }), "隐藏");
+  await expectThrow("reviewMode 对隐藏模块直接拒绝", () => run("game_material_reviewMode", { module: "tile", id: "t1", reviewMode: "auto" }), "隐藏");
+  // 「先拦后查」：这几个 id 根本不存在，但被隐藏的模块要先报「隐藏」，
+  // 否则模型会以为「只是没找到」，转头换个 id 继续试。
+  await expectThrow("status 先报隐藏、再谈找不找得到", () => run("game_material_status", { id: "tdeadbeef" }), "隐藏");
+  await expectThrow("status 只给 module 时也拦", () => run("game_material_status", { module: "tile" }), "隐藏");
+  await expectThrow("review 对隐藏模块直接拒绝", () => run("game_material_review", { id: "tdeadbeef" }), "隐藏");
+  await expectThrow("wait 对隐藏模块直接拒绝", () => run("game_material_wait", { id: "rdeadbeef", timeoutSeconds: 1 }), "隐藏");
+  await expectThrow("approve 对隐藏模块直接拒绝", () => run("game_material_approve", { id: "tdeadbeef", approved: true }), "隐藏");
+
+  const hiddenStatus = await run("game_material_status", {});
+  check("status 里列出当前被隐藏的模块", JSON.stringify(hiddenStatus.hiddenModules) === JSON.stringify(["rig", "tile"]), JSON.stringify(hiddenStatus.hiddenModules));
+  check(
+    "status 不再列出被隐藏模块的清单",
+    Array.isArray(hiddenStatus.tileProjects) && hiddenStatus.tileProjects.length === 0 && hiddenStatus.rigJobs.length === 0,
+    `${hiddenStatus.tileProjects?.length} / ${hiddenStatus.rigJobs?.length}`
+  );
+  check(
+    "status 不再给被隐藏模块的深链接",
+    hiddenStatus.links?.tile === undefined && hiddenStatus.links?.rig === undefined,
+    Object.keys(hiddenStatus.links ?? {}).join("、")
+  );
+  check("可见模块的深链接还在", typeof hiddenStatus.links?.sprite === "string", String(hiddenStatus.links?.sprite));
+  const hiddenStatusText = tool("game_material").output
+    .render({ action: "status" }, hiddenStatus)
+    .map((block) => block.text)
+    .join("\n");
+  check("status 的文本渲染里点明了隐藏项", hiddenStatusText.includes("已隐藏的功能"), hiddenStatusText.slice(0, 90).replace(/\n/g, " | "));
+
+  // 手册也要跟着隐藏：overview / methods 不能泄露被隐藏模块的能力与深链接。
+  await expectThrow("guide 对隐藏模块直接拒绝", () => run("game_material", { action: "guide", topic: "tile" }), "隐藏");
+  const hiddenOverview = await run("game_material", { action: "guide", topic: "overview" });
+  check(
+    "overview 不泄露被隐藏模块",
+    !hiddenOverview.text.includes("45°地图地块生成") && !hiddenOverview.text.includes("骨骼动画生成"),
+    hiddenOverview.text.slice(0, 120)
+  );
+  const hiddenMethods = await run("game_material", { action: "guide", topic: "methods" });
+  check(
+    "methods 不泄露被隐藏模块的方法",
+    !hiddenMethods.text.includes("runTileItems") && !hiddenMethods.text.includes("runRigSheet"),
+    ""
+  );
+
+  // 取消隐藏必须**立刻**生效，不需要重启宿主（配置是内存缓存，工具每次现读）。
+  await studio.saveConfig({ hiddenModules: [] });
+  const restored = await run("game_material_call", { method: "listTileProjects" });
+  check("取消隐藏后立刻恢复可调用", restored.ok === true, JSON.stringify(restored).slice(0, 60));
+  check(
+    "恢复后 status 重新给出全部链接",
+    Object.keys((await run("game_material_status", {})).links ?? {}).length === links.STUDIO_MODULES.length,
+    `${Object.keys((await run("game_material_status", {})).links ?? {}).length}`
+  );
+
+  // ── 7. 深链接：宿主与浏览器半区必须用同一套常量 ─────────────────────────
+  console.log("\n7) 深链接契约");
+  check("查询参数名一致", links.OPEN_QUERY_KEY === "dsh-gmm", links.OPEN_QUERY_KEY);
+  check("面板 id 与客户端一致", links.PANEL_KEY === "gameStudio", links.PANEL_KEY);
+  check(
+    "模块名与界面一致（按 STUDIO_MODULES 派生，不写死个数）",
+    links.STUDIO_MODULES.join(",") === "sprite,image,sequence,rig,tile,map,music,sfx",
+    links.STUDIO_MODULES.join(",")
+  );
+
+  const link = links.buildOpenLink({ module: "sprite", projectId, stage: "videos" }, "http://127.0.0.1:43120");
+  check(
+    "深链接形态正确",
+    link === `http://127.0.0.1:43120/?dsh-gmm=1&module=sprite&project=${projectId}&stage=videos`,
+    link
+  );
+  check("解析回来完全一致", JSON.stringify(links.parseIntentQuery(link.split("?")[1])) === JSON.stringify({ module: "sprite", projectId, stage: "videos" }));
+  check("不是深链接的查询串返回 undefined", links.parseIntentQuery("foo=1") === undefined);
+  check("非法模块名被丢掉", links.parseIntentQuery("dsh-gmm=1&module=hack")?.module === undefined);
+  check("未上报 origin 时退化成 http://localhost", links.originForLinks() === "http://localhost", links.originForLinks());
+  check("上报后 origin 生效", links.rememberClientOrigin("http://127.0.0.1:43120") && links.originForLinks() === "http://127.0.0.1:43120");
+  check("非法 origin 被拒绝", links.rememberClientOrigin("file:///x") === false && links.originForLinks() === "http://127.0.0.1:43120");
+  /**
+   * DSH 0.2.1 的 `--public-url https://host/prefix/`：反代会把前缀剥掉，
+   * 所以宿主拼回链与产物地址时必须把它补回去。少了前缀的表现是「点回链
+   * 落到反代根路径」/「面板里的图全裂」，都不报错。
+   */
+  check(
+    "路径前缀：origin 带前缀时自动识别",
+    links.rememberClientOrigin("https://game.example/prefix/") && links.originForLinks() === "https://game.example" && links.appBasePath() === "/prefix",
+    `${links.originForLinks()} + ${links.appBasePath()}`
+  );
+  check(
+    "路径前缀：深链接补在 origin 后面",
+    links.buildOpenLink({ module: "sprite", projectId }) === `https://game.example/prefix/?dsh-gmm=1&module=sprite&project=${projectId}`,
+    links.buildOpenLink({ module: "sprite", projectId })
+  );
+  check(
+    "路径前缀：产物 assetBase 也补前缀（否则反代后面图裂）",
+    links.assetBasePath("/dsh-game-material-master/assets/p1/") === "/prefix/dsh-game-material-master/assets/p1/",
+    links.assetBasePath("/dsh-game-material-master/assets/p1/")
+  );
+  check(
+    "路径前缀：非法值（.. / 反斜杠 / 相对路径）一律退回根路径",
+    links.rememberClientOrigin("https://game.example", "/a/../b") && links.appBasePath() === "" &&
+      links.rememberClientOrigin("https://game.example", "prefix") && links.appBasePath() === "" &&
+      links.rememberClientOrigin("https://game.example", "/a\\b") && links.appBasePath() === "",
+    links.appBasePath()
+  );
+  check(
+    "路径前缀：显式传 origin 的调用点保持原语义（不重复补前缀）",
+    links.buildOpenLink({ module: "sprite", projectId }, "http://127.0.0.1:43120") === `http://127.0.0.1:43120/?dsh-gmm=1&module=sprite&project=${projectId}`,
+    links.buildOpenLink({ module: "sprite", projectId }, "http://127.0.0.1:43120")
+  );
+  links.rememberClientOrigin("https://game.example", "/prefix/");
+  const prefixedStatus = await run("game_material_status", { module: "sprite", id: projectId });
+  check(
+    "路径前缀：status 里的 assetBase 也补前缀（工具面与界面走同一份）",
+    JSON.stringify(prefixedStatus).includes("/prefix/dsh-game-material-master/assets/"),
+    JSON.stringify(prefixedStatus).slice(0, 160)
+  );
+  // 后面的断言按本地根路径继续，把状态复位。
+  check("复位到根路径", links.rememberClientOrigin("http://127.0.0.1:43120") && links.appBasePath() === "" && links.originForLinks() === "http://127.0.0.1:43120");
+
+  /**
+   * ── 「AI 生成素材」回链的四个参数（dialog / asset / frames / shape）────────
+   *
+   * 这条链接是**对话 → 界面**的唯一通道：对话里 agent 贴出来的 URL 必须让地图编辑器
+   * 展开素材窗口 + 打开「新增素材」+ 预选好那张图与「这块素材怎么用」。参数少一个，
+   * 用户点开只会落在一张空的地图编辑器上（或者把拼块当成普通素材导入），而且不报错
+   * —— 所以这里把「拼出去」与「解回来」逐字段钉住，并配反向验证（坏值必须被丢掉）。
+   */
+  const assetLink = links.buildOpenLink(
+    { module: "map", jobId: "m1a2b3c4", stage: "assets", dialog: "add", asset: "ai/岩浆.png", frames: 4, shape: "a2quad", scale: 4 },
+    "http://127.0.0.1:43120"
+  );
+  check(
+    "回链形态正确（module / job / stage / dialog / asset / frames / shape / scale 一个不少）",
+    assetLink === `http://127.0.0.1:43120/?dsh-gmm=1&module=map&job=m1a2b3c4&stage=assets&dialog=add&asset=ai%2F%E5%B2%A9%E6%B5%86.png&frames=4&shape=a2quad&scale=4`,
+    assetLink
+  );
+  check("回链解析回来完全一致", (() => {
+    const parsed = links.parseIntentQuery(assetLink.split("?")[1]);
+    return parsed?.module === "map" && parsed?.jobId === "m1a2b3c4" && parsed?.stage === "assets" && parsed?.dialog === "add" && parsed?.asset === "ai/岩浆.png" && parsed?.frames === 4 && parsed?.shape === "a2quad" && parsed?.scale === 4;
+  })(), JSON.stringify(links.parseIntentQuery(assetLink.split("?")[1])));
+  check("反向验证：dialog 只认 add（别的值丢掉）", links.parseIntentQuery("dsh-gmm=1&dialog=nope")?.dialog === undefined);
+  check(
+    "整图回链：cols / rows 只认 2~512 的整数（0 / 513 / 小数丢掉）",
+    links.parseIntentQuery("dsh-gmm=1&cols=4&rows=3")?.cols === 4 &&
+      links.parseIntentQuery("dsh-gmm=1&cols=4&rows=3")?.rows === 3 &&
+      // 上限是 512（真正的上限是地图大小，由宿主按项目校验）
+      links.parseIntentQuery("dsh-gmm=1&cols=64&rows=48")?.cols === 64 &&
+      links.parseIntentQuery("dsh-gmm=1&cols=1")?.cols === undefined &&
+      links.parseIntentQuery("dsh-gmm=1&rows=513")?.rows === undefined &&
+      links.parseIntentQuery("dsh-gmm=1&cols=3.5")?.cols === undefined
+  );
+  check("整图回链：shape=stamp 时 cols/rows 也进查询串", (() => {
+    const query = links.intentQuery({ module: "map", jobId: "m1", dialog: "add", asset: "ai/雕像.png", shape: "stamp", cols: 4, rows: 2, frames: 3 });
+    return query.includes("shape=stamp") && query.includes("cols=4") && query.includes("rows=2") && query.includes("frames=3");
+  })());
+  check(
+    "反向验证：scale 只认 1~8 的整数（0 / 9 / 小数全部丢掉）",
+    links.parseIntentQuery("dsh-gmm=1&scale=4")?.scale === 4 &&
+      links.parseIntentQuery("dsh-gmm=1&scale=0")?.scale === undefined &&
+      links.parseIntentQuery("dsh-gmm=1&scale=9")?.scale === undefined &&
+      links.parseIntentQuery("dsh-gmm=1&scale=2.5")?.scale === undefined
+  );
+  check(
+    "反向验证：shape 只认 plain / corner16 / a2quad（别的值丢掉，别把链接当任意指令用）",
+    ["plain", "corner16", "a2quad"].every((shape) => links.parseIntentQuery(`dsh-gmm=1&shape=${shape}`)?.shape === shape) &&
+      links.parseIntentQuery("dsh-gmm=1&shape=hex")?.shape === undefined &&
+      links.parseIntentQuery("dsh-gmm=1&shape=")?.shape === undefined
+  );
+  check(
+    "反向验证：asset 只认项目内的相对路径（绝对路径 / .. / 反斜杠全部丢掉）",
+    links.parseIntentQuery("dsh-gmm=1&asset=/etc/passwd")?.asset === undefined &&
+      links.parseIntentQuery("dsh-gmm=1&asset=../../x.png")?.asset === undefined &&
+      links.parseIntentQuery("dsh-gmm=1&asset=a%5Cb.png")?.asset === undefined
+  );
+  check("反向验证：frames 只认正整数（0 / 小数 / 乱码都丢掉）", links.parseIntentQuery("dsh-gmm=1&frames=0")?.frames === undefined && links.parseIntentQuery("dsh-gmm=1&frames=2.5")?.frames === undefined && links.parseIntentQuery("dsh-gmm=1&frames=abc")?.frames === undefined);
+  check("反向验证：只给 dialog 不给 asset 也合法（界面退化成「打开新增素材」）", (() => {
+    const parsed = links.parseIntentQuery("dsh-gmm=1&module=map&job=m1&stage=assets&dialog=add");
+    return parsed?.dialog === "add" && parsed?.asset === undefined;
+  })());
+
+  // 浏览器半区是经典脚本（不能 import），只能靠文本契约保证两边同源。
+  const clientSource = readFileSync(fileURLToPath(new URL("../src/client.ts", import.meta.url)), "utf8");
+  const clientBundle = readFileSync(fileURLToPath(new URL("../lib/client.js", import.meta.url)), "utf8");
+  for (const [label, text] of [
+    ["src/client.ts", clientSource],
+    ["lib/client.js", clientBundle]
+  ]) {
+    check(`${label}：含同名查询参数`, text.includes(`"${links.OPEN_QUERY_KEY}"`), links.OPEN_QUERY_KEY);
+    check(`${label}：含面板 id 常量`, text.includes(`"${links.PANEL_KEY}"`), links.PANEL_KEY);
+    check(`${label}：含全部模块名（${links.STUDIO_MODULES.length} 个）`, links.STUDIO_MODULES.every((module) => text.includes(`"${module}"`)), links.STUDIO_MODULES.join("、"));
+    check(`${label}：注册了捕获阶段的链接拦截`, text.includes('addEventListener("click"') && text.includes("true)"), "捕获阶段");
+    check(`${label}：会上报 origin`, text.includes("reportClientOrigin"), "");
+    check(`${label}：读取地址栏里的深链接`, text.includes("consumeUrlIntent"), "");
+    // 新参数只按文本契约钉：浏览器半区不能 import（links.ts 的那份是拷贝）。
+    check(`${label}：含 OPEN_DIALOGS（只放行 add）`, text.includes('OPEN_DIALOGS = new Set(["add"])'), "");
+    check(`${label}：含 OPEN_SHAPES（放行 plain / corner16 / a2quad / stamp）`, text.includes('OPEN_SHAPES = new Set(["plain", "corner16", "a2quad", "stamp"])'), "");
+    check(`${label}：清地址栏时把 dialog / asset / frames / shape / scale / cols / rows 一起摘掉`, text.includes('"dialog", "asset", "frames", "shape", "scale", "cols", "rows"'), "");
+    check(`${label}：解析 asset 会挡绝对路径与 ..`, text.includes('!asset.startsWith("/")') && text.includes("!asset.includes(\"..\")"), "");
+  }
+  check("client.ts 里没有任何 import（必须是经典脚本）", !/^\s*import\s/m.test(clientSource), "");
+
+  // ── 8b. 语义角色的两边一致性 ──────────────────────────────────────────
+  // 浏览器半区不能 import，所以 RIG_ROLES / ROLE_LABELS 必然是一份拷贝。
+  // 这里逐项比对宿主导出的真源，防止「界面上能选、宿主不认识」这类漂移。
+  {
+    const semantics = await import("../lib/rigsemantics.js");
+    const hostRoles = [...semantics.RIG_ROLES];
+    // 文案已 i18n 化：client.ts 里是 `label: T("头部")`。这里比对的是**中文原文**
+    // （词条表的 key），也就是宿主的 ROLE_LABELS——比英文译文才是真契约。
+    const clientRoles = [...clientSource.matchAll(/\{\s*key:\s*"(\w+)",\s*label:\s*(?:T\()?"([^"]+)"\)?\s*\}/g)].map((m) => [m[1], m[2]]);
+    const missing = hostRoles.filter((role) => !clientRoles.some(([key]) => key === role));
+    const extra = clientRoles.filter(([key]) => !hostRoles.includes(key));
+    check("客户端角色列表覆盖宿主的全部角色", missing.length === 0, missing.join("、"));
+    check("客户端没有宿主不认识的额外角色", extra.length === 0, extra.map(([key]) => key).join("、"));
+    const labelMismatch = hostRoles.filter((role) => {
+      const found = clientRoles.find(([key]) => key === role);
+      return found !== undefined && found[1] !== semantics.ROLE_LABELS[role];
+    });
+    check("角色的中文名两边一致", labelMismatch.length === 0, labelMismatch.join("、"));
+    check("客户端角色数量与宿主一致", clientRoles.length === hostRoles.length, `${clientRoles.length} vs ${hostRoles.length}`);
+  }
+
+  // ── 8. 浏览器半区的方法清单与宿主 manifest 必须一一对应 ─────────────────
+  console.log("\n8) 远程方法清单一致性");
+  const clientEntries = [...clientSource.matchAll(/^\s*\["(\w+)",\s*(true|false)\],?$/gm)].map((match) => ({
+    method: match[1],
+    payload: match[2] === "true"
+  }));
+  const listed = clientEntries.map((entry) => entry.method);
+  const manifestMethods = METHODS.map((spec) => spec.method);
+  const missingInClient = manifestMethods.filter((method) => !listed.includes(method));
+  const extraInClient = listed.filter((method) => !manifestMethods.includes(method));
+  check("客户端清单覆盖全部方法", missingInClient.length === 0, missingInClient.join("、"));
+  check("客户端没有多余方法", extraInClient.length === 0, extraInClient.join("、"));
+
+  /**
+   * 第二个字段是「这个方法收不收 payload」，两边必须**逐条**一致。
+   *
+   * 只比方法名是不够的：把收 payload 的方法标成 false，typert 会在浏览器侧直接拒绝
+   * （`expected 0 argument(s), got 1`），界面表现是「点了没反应 + 一行错误」，
+   * 既不崩也不影响别的功能，很容易漏过。实测 `getTileProject` 就是这么错的。
+   */
+  const payloadMismatch = [];
+  for (const spec of METHODS) {
+    const entry = clientEntries.find((item) => item.method === spec.method);
+    if (entry === undefined) continue;
+    const hostHasPayload = spec.payload !== undefined;
+    if (entry.payload !== hostHasPayload) {
+      payloadMismatch.push(`${spec.method}（客户端 ${entry.payload} / 宿主 ${hostHasPayload}）`);
+    }
+  }
+  check("客户端清单的 payload 标记与宿主一致", payloadMismatch.length === 0, payloadMismatch.join("、"));
+
+  // ── 9. 系统提示词只负责指路，完整流程在 guide ─────────────────────────
+  console.log("\n9) 系统提示词与 guide 的分工");
+  check("注册了 game-material-master 提示词段", captured.sections.length === 1 && captured.sections[0].name === "game-material-master", captured.sections.map((s) => s.name).join("、"));
+  const prompt = captured.sections[0]?.text ?? "";
+  check("提示词保持紧凑（< 600 B）", Buffer.byteLength(prompt) < 600, `${Buffer.byteLength(prompt)} B`);
+  check("提示词指向 game_material 与 guide", /game_material/.test(prompt) && /guide/.test(prompt), prompt);
+  const workflowGuide = (await onlyTool.execute({ action: "guide", topic: "workflow" }, {})).text;
+  check("workflow 要求先 intake", /先调用/.test(workflowGuide) && /action:["']intake["']/.test(workflowGuide), "");
+  check("workflow 要求问自动/人工审核", /自动审核/.test(workflowGuide) && /人工审核/.test(workflowGuide), "");
+  check("workflow 要求得到答复前不许生成", /不要调用任何生成类/.test(workflowGuide), "");
+  check("workflow 要求把 openUrl 写成 Markdown 链接", /Markdown 链接/.test(workflowGuide) && /openUrl/.test(workflowGuide), "");
+  check("workflow 区分插件入口与文件直链", /插件界面入口/.test(workflowGuide) && /文件直链/.test(workflowGuide), "");
+  check("workflow 说明 manual 模式要停下等确认", /停下等用户回复/.test(workflowGuide), "");
+  check("workflow 提醒计费", /计费/.test(workflowGuide), "");
+  check("提示词段有稳定 order（利于 KV 缓存）", Number.isFinite(captured.sections[0]?.order), String(captured.sections[0]?.order));
+
+  // ── 10. 指导手册必须覆盖「模型该怎么用」的那几个方法 ────────────────────
+  // 新增一个 AI 能调的方法、却忘了写进手册里，结果就是「能力做了但模型不知道」。
+  {
+    const rigGuide = (await onlyTool.execute({ action: "guide", topic: "rig" }, {})).text;
+    const mustBeDocumented = [
+      "setRigSemantics",
+      "setRigBoneOffsets",
+      "resetRigBoneOffsets",
+      "setRigAnimationSettings",
+      "resetRigAnimationSettings",
+      "setRigLayoutHints",
+      "tintRigParts",
+      "setRigTextureVersion"
+    ];
+    const missing = mustBeDocumented.filter((method) => !rigGuide.includes(method));
+    check(`骨骼动画的三层修改方法都写进了 rig 手册（共 ${rigGuide.length} 字符）`, missing.length === 0, missing.join("、"));
+    check("rig 手册说明「重跑不会抹掉人工改动」", /互不覆盖|不会覆盖|不会被覆盖/.test(rigGuide), "");
+    check("rig 手册说明构建失败要先读 error", /导出前校验|构建失败/.test(rigGuide), "");
+  }
+
+  // ── 11. 模块五在**对话调用面**上真的能用 ────────────────────────────────
+  //
+  // 这一节补的是真机验证暴露出来的盲区：verify-tools 原来只比对模块名，
+  // 一个 tile 工具都没真调过。而 intake 里用了一批**中文属性名**
+  // （`known.几何由代码保证` 之类）—— 那种写法一旦有非法标识符字符就会静默
+  // 变成运行时问题（`②` 就真的编译不过）。所以这里真调一遍。
+  {
+    check("单一工具同时承载 intake / status / review / call", typeof onlyTool.execute === "function");
+
+    // ① 先建一个真实的地图地块项目（走真实网关，数据落在临时 DSH_HOME）
+    const created = await studio.createTileProject({ name: "对话面验证", lang: "zh" });
+    const tileId = created.id;
+    try {
+      check("tile 项目 id 被判为 tile 模块", moduleForId(tileId) === "tile", moduleForId(tileId));
+
+      // ② intake：必须能渲染出来，且把「四个阶段」与「只有第①步花钱」讲清楚
+      const intake = await run("game_material_intake", { module: "tile", id: tileId });
+      const intakeText = typeof intake === "string" ? intake : JSON.stringify(intake);
+      check("intake 对 tile 不抛异常且返回了内容", intakeText.length > 50, `${intakeText.length} 字符`);
+      check("intake 讲清了四个阶段", /生成.*验收.*拼.*导出/s.test(intakeText.replace(/\\n/g, " ")) || /四个阶段/.test(intakeText));
+      check("intake 点明了只有第②步花钱", /只有一个?钱|计费|花钱/.test(intakeText));
+      check("intake 问了画风与地块清单", /画风/.test(intakeText) && /地块/.test(intakeText));
+      check("intake 带上了 openUrl 深链接", /openUrl/.test(intakeText) && /module=tile/.test(intakeText));
+
+      // ③ status：不给 id 时要列出 tile 项目；给 id 时要回几何与产物 URL
+      const listed = await run("game_material_status", { module: "tile" });
+      check("status 不给 id 时列出 tile 项目", JSON.stringify(listed).includes(tileId));
+
+      const detail = await run("game_material_status", { module: "tile", id: tileId });
+      const detailText = JSON.stringify(detail);
+      check("status 给了 id 时返回该 project 的快照", detailText.includes(tileId) || detail?.id === tileId);
+      check("status 的快照里有 assetBase（界面据此拼产物 URL）",
+        detailText.includes("tile-assets") || detail?.assetBase !== undefined);
+
+      // ④ review：没产物时也要给出可读的结论，而不是崩
+      const review = await run("game_material_review", { module: "tile", id: tileId });
+      const reviewText = JSON.stringify(review);
+      check("review 对空项目不抛异常", reviewText.length > 20, `${reviewText.length} 字符`);
+      check("review 带了 openUrl", reviewText.includes("openUrl") || typeof review?.openUrl === "string");
+
+      // ⑤ call：tile 的远程方法要通过 call 通道可达（guide 的模块手册里有它）
+      const tileGuide = (await onlyTool.execute({ action: "guide", topic: "tile" }, {})).text;
+      const tileMethods = ["listTileProjects", "createTileProject", "getTileProject",
+        "runTileItems", "setTileApproved", "runTileMap", "runTileExport"];
+      const missingTile = tileMethods.filter((m) => !tileGuide.includes(m));
+      check("地图地块的远程方法都写进了 tile 手册", missingTile.length === 0, missingTile.join("、"));
+    } finally {
+      await studio.deleteTileProject({ projectId: tileId });
+    }
+  }
+
+  await rm(HOME, { recursive: true, force: true });
+
+  console.log("");
+  if (failures.length > 0) {
+    console.error(`失败 ${failures.length} 项：${failures.join("、")}`);
+    process.exit(1);
+  }
+  console.log(`共 ${checks} 项检查，全部通过。`);
+}
+
+await main();

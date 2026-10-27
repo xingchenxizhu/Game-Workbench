@@ -1,0 +1,931 @@
+/**
+ * 浏览器半区契约自检：不需要浏览器、不联网，就能验证
+ *   「阶段渲染函数从 ctx 里取哪些键，调用点就必须原样转发哪些键」，
+ *   以及「所有会出素材的接口调用都带了 loading 反馈」。
+ *
+ *   node scripts/verify-client.mjs                 # 默认检查 src/client.ts 与 lib/client.js
+ *   node scripts/verify-client.mjs <文件…>          # 只检查指定文件（用于回归验证）
+ *
+ * 这个检查是为一个实测 bug 加的：`renderVideoStage(ctx)` 内部
+ * `const { project, api, … } = ctx`，但 `StudioPanel` 里的调用点漏传了 `api`，
+ * 于是界面渲染完全正常，**一点「生成视频」就炸**：
+ *   Cannot read properties of undefined (reading 'runVideos')
+ * 同样的漏传还波及第 3 步抽帧（`runFrames`）与第 4 步合成（`compose`）。
+ *
+ * 为什么编译器没拦住：`src/client.ts` 虽然是 TS，但这些渲染函数的 `ctx` 参数是隐式
+ * any（tsconfig 里 `noImplicitAny: false`，与整份文件的 JS 风格一致），
+ * 少传一个键不会有任何提示。所以这里用文本解析把契约钉死。
+ *
+ * 第二类检查同样是为实测问题加的：生图 / 生视频 / 抽帧 / 抠像 / 合成这些调用
+ * 动辄几秒到几分钟，**调用期间界面没有任何变化**，用户会以为按钮没生效而反复点。
+ * 现在每个生成类调用点都必须把 pending 的 key 与文案传下去，且界面必须真的
+ * 用上遮罩 / 转圈组件；漏一个就是「点了没反应」。
+ */
+
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+const failures = [];
+let checks = 0;
+function check(name, ok, detail) {
+  checks++;
+  // 说明文字只在**失败**时打印：通过时还挂一句「缺少 rig-bones-db 区块」会让人以为出事了。
+  console.log(`  ${ok ? "✓" : "✗"} ${name}${!ok && detail !== undefined ? ` — ${detail}` : ""}`);
+  if (!ok) failures.push(name);
+}
+
+const DEFAULT_FILES = ["../src/client.ts", "../lib/client.js"].map((rel) =>
+  fileURLToPath(new URL(rel, import.meta.url))
+);
+
+/** 从 `open` 处的 `{` 开始，返回与它配对的 `}` 之间的文本。 */
+function bracedBody(text, open) {
+  let depth = 0;
+  let quote = null;
+  for (let i = open; i < text.length; i++) {
+    const ch = text[i];
+    if (quote !== null) {
+      if (ch === quote && text[i - 1] !== "\\") quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "{") depth++;
+    else if (ch === "}") {
+      depth--;
+      if (depth === 0) return text.slice(open + 1, i);
+    }
+  }
+  return null;
+}
+
+/**
+ * 取出对象字面量的顶层键名：`{ a, b, c: 1 }` → ["a", "b", "c"]。
+ * 展开运算符（`...x`）无法静态判定，返回 null 让调用方跳过。
+ */
+function objectKeys(body) {
+  if (body.includes("...")) return null;
+  const parts = [];
+  let depth = 0;
+  let current = "";
+  let quote = null;
+  for (let i = 0; i < body.length; i++) {
+    const ch = body[i];
+    if (quote !== null) {
+      current += ch;
+      if (ch === quote && body[i - 1] !== "\\") quote = null;
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") {
+      quote = ch;
+      current += ch;
+      continue;
+    }
+    if ("{[(".includes(ch)) depth++;
+    else if ("}])".includes(ch)) depth--;
+    if (ch === "," && depth === 0) {
+      parts.push(current);
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  parts.push(current);
+  return parts
+    .map((part) => {
+      const text = part.trim();
+      if (text === "") return null;
+      const withValue = /^([A-Za-z_$][\w$]*)\s*:/.exec(text);
+      if (withValue !== null) return withValue[1];
+      const shorthand = /^([A-Za-z_$][\w$]*)$/.exec(text);
+      return shorthand === null ? null : shorthand[1];
+    })
+    .filter((key) => key !== null);
+}
+
+/** 找 `function NAME(ctx) {` 的函数体，并读出它从 ctx 解构出来的键。 */
+function renderersIn(text) {
+  const found = new Map();
+  const re = /function\s+(\w+)\s*\(\s*ctx\s*\)\s*\{/g;
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    const body = bracedBody(text, match.index + match[0].length - 1);
+    if (body === null) continue;
+    const destructured = /const\s*\{([\s\S]*?)\}\s*=\s*ctx\s*;/.exec(body);
+    if (destructured === null) continue;
+    const keys = objectKeys(destructured[1]);
+    if (keys === null) continue;
+    found.set(match[1], keys);
+  }
+  return found;
+}
+
+/** 找 `NAME({ … })` 形式、带对象字面量实参的调用点。 */
+function callSitesIn(text, name) {
+  const sites = [];
+  const re = new RegExp(`(?<![\\w$.])${name}\\s*\\(`, "g");
+  let match;
+  while ((match = re.exec(text)) !== null) {
+    let cursor = re.lastIndex;
+    while (cursor < text.length && /\s/.test(text[cursor])) cursor++;
+    if (text[cursor] !== "{") continue;
+    const body = bracedBody(text, cursor);
+    if (body === null) continue;
+    sites.push({
+      line: text.slice(0, match.index).split("\n").length,
+      keys: objectKeys(body) ?? [],
+      spread: body.includes("...")
+    });
+  }
+  return sites;
+}
+
+const files = process.argv.slice(2).length > 0 ? process.argv.slice(2) : DEFAULT_FILES;
+
+// ── 第二类检查：所有「出素材」的接口调用都要有 loading 反馈 ─────────────
+/**
+ * 必须带 pending 反馈的调用（key = 方法名，value = 这类调用的产物）。
+ * 判定标准：调用点所属的那次 `start(...)` / `run(...)` / `kickAndWatch(...)`
+ * 调用必须给出 `{ key: …, label: … }` 作为最后一个实参。
+ */
+const FEEDBACK_REQUIRED = {
+  runImages: "批量生图",
+  runImage: "单方向生图",
+  runVideos: "生视频",
+  runFrames: "抽帧",
+  prepareFramePick: "手动选帧候选帧",
+  setFramePick: "改序列帧位置",
+  resetFramePicks: "重置序列帧圆圈",
+  rekey: "重跑抠像",
+  compose: "合成整图",
+  runTurnVideo: "转圈视频",
+  runTurnFrames: "转圈候选帧抽取",
+  setTurnPick: "改截帧位置",
+  uploadVideo: "本地自选视频（转圈 / 某方向）",
+  exportImages: "中间图片打包",
+  runImageJob: "图片生成",
+  keyImageJob: "图片抠像",
+  runSequenceVideo: "序列帧：生视频",
+  runSequenceFrames: "序列帧：抽帧",
+  keySequenceFrames: "序列帧：抠像",
+  composeSequence: "序列帧：合成",
+  pollVideos: "刷新视频进度",
+  pollSequenceVideo: "刷新序列帧视频进度"
+};
+
+/** 必须在样式里出现、且被 render 真用到的反馈组件 / 类名。 */
+const FEEDBACK_PIECES = [
+  ["usePendingTasks", "pending 记账 hook"],
+  ["LoadingOverlay", "预览区 loading 遮罩"],
+  ["BusyBtn", "按钮级转圈"],
+  ["BusyBadge", "工具栏状态徽章"],
+  ["data-busy", "遮罩/按钮的忙碌标记"],
+  [".SPR_ovl{", "遮罩样式"],
+  [".SPR_spin{", "转圈动画"],
+  ["@keyframes SPR_spin", "动画关键帧"],
+  ["prefers-reduced-motion", "减少动画偏好"]
+];
+
+/** 从 `open` 处的 `{` 开始，返回与它配对的 `}` 的下标（文本已去掉字符串与注释）。 */
+function matchingBrace(code, open) {
+  let depth = 0;
+  for (let i = open; i < code.length; i++) {
+    if (code[i] === "{") depth++;
+    else if (code[i] === "}") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** 用等长空白替换注释与字符串，保证下标与原文一一对应。 */
+function blankOut(text) {
+  const out = text.split("");
+  let i = 0;
+  const n = text.length;
+  while (i < n) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (ch === "/" && next === "/") {
+      while (i < n && text[i] !== "\n") out[i++] = " ";
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      out[i++] = " ";
+      out[i++] = " ";
+      while (i < n && !(text[i] === "*" && text[i + 1] === "/")) {
+        if (text[i] !== "\n") out[i] = " ";
+        i++;
+      }
+      if (i < n) {
+        out[i++] = " ";
+        out[i++] = " ";
+      }
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      out[i++] = " ";
+      while (i < n && text[i] !== quote) {
+        if (text[i] === "\\") {
+          out[i] = " ";
+          i++;
+        }
+        if (i < n && text[i] !== "\n") out[i] = " ";
+        i++;
+      }
+      if (i < n) out[i++] = " ";
+      continue;
+    }
+    i++;
+  }
+  return out.join("");
+}
+
+/**
+ * 找出每个「wrapper(fn, …, { key, label })」调用点里，作为最后实参的反馈对象。
+ * 这里不解析语法树，只按括号配对切分实参，够用且不引入依赖。
+ */
+function callsWithFeedback(code, wrapperNames) {
+  const results = [];
+  for (const wrapper of wrapperNames) {
+    const re = new RegExp(`(?<![\\w$.])${wrapper}\\s*\\(`, "g");
+    let match;
+    while ((match = re.exec(code)) !== null) {
+      const open = code.indexOf("(", match.index);
+      let depth = 0;
+      let end = -1;
+      for (let i = open; i < code.length; i++) {
+        if (code[i] === "(") depth++;
+        else if (code[i] === ")") {
+          depth--;
+          if (depth === 0) {
+            end = i;
+            break;
+          }
+        }
+      }
+      if (end < 0) continue;
+      const body = code.slice(open + 1, end);
+      // 顶层实参切分
+      const args = [];
+      let depth2 = 0;
+      let cur = "";
+      for (const ch of body) {
+        if ("([{".includes(ch)) depth2++;
+        else if (")]}".includes(ch)) depth2--;
+        if (ch === "," && depth2 === 0) {
+          args.push(cur);
+          cur = "";
+          continue;
+        }
+        cur += ch;
+      }
+      args.push(cur);
+      const last = args[args.length - 1].trim();
+      const line = code.slice(0, match.index).split("\n").length;
+      // 反馈对象出现在**任意一个**实参里都算（有的调用点把 feedback 放在中间，
+      // 例如 kickAndWatch(() => run(...), undefined, { key, label })）。
+      const hasKey = args.some((arg) => /\bkey\s*:/.test(arg));
+      const hasLabel = args.some((arg) => /\blabel\s*:/.test(arg));
+      results.push({ wrapper, line, at: match.index, end, hasKey, hasLabel, raw: last });
+    }
+  }
+  return results.sort((a, b) => a.at - b.at);
+}
+
+for (const file of files) {
+  const label = file.replace(/\\/g, "/").split("/").slice(-2).join("/");
+  let text;
+  try {
+    text = readFileSync(file, "utf8");
+  } catch {
+    check(`${label}：可读取`, false, file);
+    continue;
+  }
+  checkRigContracts(text, label);
+  checkTurnContracts(text, label);
+  checkFramePickContracts(text, label);
+  checkInputAndZoomContracts(text, label);
+  checkDraftContracts(text, label);
+
+  const renderers = renderersIn(text);
+  check(`${label}：找到阶段渲染函数`, renderers.size > 0, [...renderers.keys()].join("、"));
+  if (renderers.size === 0) continue;
+
+  for (const [name, needed] of renderers) {
+    const sites = callSitesIn(text, name);
+    check(`${label}：${name} 有调用点`, sites.length > 0, `${sites.length} 处`);
+    for (const site of sites) {
+      if (site.spread) {
+        check(`${label}：${name} 第 ${site.line} 行转发 ctx`, true, "实参含展开运算符，跳过静态判定");
+        continue;
+      }
+      const missing = needed.filter((key) => !site.keys.includes(key));
+      check(
+        `${label}：${name} 第 ${site.line} 行转发全部 ctx 键`,
+        missing.length === 0,
+        missing.length === 0 ? `${needed.length} 个键` : `漏传 ${missing.join("、")}（函数需要 ${needed.join("、")}）`
+      );
+    }
+  }
+
+  // ── loading 反馈：组件与样式必须在 ────────────────────────────────────
+  for (const [piece, why] of FEEDBACK_PIECES) {
+    check(`${label}：存在「${why}」`, text.includes(piece), piece);
+  }
+
+  // ── 单方向「重新生成」视频必须显式带 regenerate ──────────────────────
+  // 不带这个标记时宿主会把 ready 的方向当成「已完成」跳过：界面转一圈就结束，
+  // 真正的失败只留在日志里（实测报错：「没有可提交的方向：请先生成绿幕图，
+  // 或先清掉已完成的视频」）。所以调用点必须自己声明这是一次「重新生成」。
+  check(
+    `${label}：单方向「重新生成」视频带 regenerate 标记`,
+    /keys:\s*\[direction\.key\][\s\S]{0,400}?regenerate:/.test(text),
+    "runVideos({ keys: [direction.key], regenerate: … })"
+  );
+
+  // ── loading 反馈：每个生成类调用点都要带 key + label ──────────────────
+  const code = blankOut(text);
+  const calls = callsWithFeedback(code, ["start", "run", "kickAndWatch"]);
+  const broken = [];
+  const seen = new Set();
+  for (const [method, what] of Object.entries(FEEDBACK_REQUIRED)) {
+    const re = new RegExp(`api\\.${method}\\s*\\(`, "g");
+    let match;
+    let found = 0;
+    while ((match = re.exec(code)) !== null) {
+      found++;
+      const line = code.slice(0, match.index).split("\n").length;
+      // 负责这次 api 调用的 wrapper：起点在它之前、且包住它的**最外层**那一个。
+      // 只看行号会挑错——`kickAndWatch(() => run(() => api.x()), …)` 全在同一行；
+      // 只看最近的一个也会挑错——那样挑到内层的 run，而 feedback 在外层。
+      const owners = calls.filter((call) => call.at <= match.index && call.end >= match.index);
+      const owner = owners[0];
+      if (owner === undefined) {
+        broken.push(`${what}（第 ${line} 行 api.${method}）没有被 start/run/kickAndWatch 包住`);
+        continue;
+      }
+      if (!owner.hasKey || !owner.hasLabel) {
+        broken.push(`${what}（第 ${line} 行 api.${method}）经由 ${owner.wrapper}（第 ${owner.line} 行）但没传 { key, label }`);
+      }
+    }
+    check(`${label}：${what} 的调用点都带 loading 反馈`, found > 0 && !broken.some((item) => item.includes(what)), found === 0 ? "没找到调用点" : `${found} 处`);
+    seen.add(method);
+  }
+  if (broken.length > 0) {
+    console.log(`     ↳ ${broken.join("\n     ↳ ")}`);
+  }
+}
+
+// ── Hook 必须全在早退之前：漏一个就白屏 ────────────────────────────────
+//
+// React 要求组件每次渲染的 Hook 数量与顺序一致。这些模块组件里都有
+// 「没有选中项目就 return 空态」的早退分支；只要有一个 `useState` / `useRef` /
+// `useEffect` 被写到那条 `return` 之后，「有没有项目」一变化 Hook 数就变了 ——
+// React 直接抛 error #310（Rendered more hooks than during the previous render），
+// **整个面板白屏**，而不是某一块坏掉。
+//
+// 实测踩过：给地图编辑器加撤销栈时把 `useRef` 放在了早退之后。
+{
+  const clientText = readFileSync(fileURLToPath(new URL("../src/client.ts", import.meta.url)), "utf8");
+  const lines = clientText.split("\n");
+  // 组件边界：`function XxxModule(props) {` 到下一个顶层 `function`
+  const starts = [...clientText.matchAll(/^\s{4}function (\w*Module)\(props\)\s*\{/gm)];
+  check("浏览器半区能定位到模块组件", starts.length >= 4, `${starts.length} 个`);
+  for (let i = 0; i < starts.length; i++) {
+    const name = starts[i][1];
+    const from = clientText.slice(0, starts[i].index).split("\n").length;
+    const to = i + 1 < starts.length
+      ? clientText.slice(0, starts[i + 1].index).split("\n").length
+      : lines.length;
+    // 只认**组件顶层**（缩进 6 空格）的早退。两种写法都要认：
+    //   `if (project === null) {`  ← 实际的写法
+    //   `return h(...)`
+    // 缩进更深的 `return` 都在 useCallback / 内层函数体里，与 Hook 顺序无关
+    // （它们甚至在 Hook 之前就存在，硬判会假红）。
+    let earlyReturn = -1;
+    for (let n = from; n < to; n++) {
+      if (/^\s{6}(?:return\b|if \()/.test(lines[n - 1])) { earlyReturn = n; break; }
+    }
+    if (earlyReturn < 0) continue;
+    // 从组件起点按**花括号配平**算出「顶层语句」的行号集合：只有深度回到
+    // 组件函数体的那一层（深度 1）才算顶层。`const [x] = useState(...)` 是浅层，
+    // `useEffect(() => { ... })` 的箭头函数体是深层 —— 用深度区分，不用缩进猜。
+    const componentBody = [];
+    {
+      let depth = 0;
+      let started = false;
+      for (let n = from; n < to; n++) {
+        const line = lines[n - 1];
+        if (!started) {
+          if (line.includes("{")) { started = true; depth = 1; }
+          continue;
+        }
+        if (depth === 1) componentBody.push(n);
+        for (const ch of line) {
+          if (ch === "{") depth++;
+          else if (ch === "}") depth--;
+        }
+        if (depth <= 0) break;
+      }
+    }
+    // 顶层 Hook 全部必须在早退之前
+    const bad = componentBody
+      .filter((n) => n > earlyReturn)
+      .filter((n) => /React\.use(State|Ref|Effect|Callback|Memo|LayoutEffect)\b/.test(lines[n - 1]))
+      .map((n) => `${n}:${lines[n - 1].trim().slice(0, 60)}`);
+    check(`${name}：Hook 全在早退（第 ${earlyReturn} 行）之前`, bad.length === 0,
+      bad.slice(0, 3).join(" | "));
+  }
+}
+
+// ── 宿主后台任务 key：浏览器半区与宿主是两份实现，只能靠文本契约对齐 ──────
+//
+// 界面判断「这一批还在跑」靠宿主运行表里的任务（`project.jobs[].targets`）：
+// 批量抽帧是 kick 型调用，远程调用立刻返回，真正的活在后台一个方向一个方向地做，
+// 本地 pending 表那 700ms 撑不住——实测表现就是点「提取全部序列帧」后八个方向
+// 先一起转圈，紧接着还没轮到的变回「尚未抽帧」，过一阵才出结果。
+//
+// 任务 key 写错一个字不会有任何报错，只是这条路静默失效，所以两边一起核对：
+// 浏览器半区点了名的 key，宿主必须真有这个任务，而且必须公布覆盖面。
+{
+  const clientText = readFileSync(fileURLToPath(new URL("../src/client.ts", import.meta.url)), "utf8");
+  const hostText = readFileSync(fileURLToPath(new URL("../src/pipeline.ts", import.meta.url)), "utf8");
+
+  const clientKeys = [...new Set(
+    [...clientText.matchAll(/hostJob\(\s*project\s*,\s*"([^"]+)"\s*\)/g)].map((match) => match[1])
+  )];
+  const kicked = new Set([...hostText.matchAll(/kick\(\s*projectId\s*,\s*"([^"]+)"/g)].map((match) => match[1]));
+  const published = new Set(
+    [...hostText.matchAll(/(?:setJobTargets|addJobTargets)\(\s*projectId\s*,\s*"([^"]+)"/g)].map((match) => match[1])
+  );
+
+  check("浏览器半区按宿主任务 key 判断批量进度", clientKeys.length >= 3, clientKeys.join("、") || "(一个都没有)");
+  for (const key of clientKeys) {
+    check(`宿主存在后台任务 ${key}`, kicked.has(key), [...kicked].join("、"));
+    check(`后台任务 ${key} 公布覆盖面 targets`, published.has(key), [...published].join("、"));
+  }
+}
+
+// ── 功能管理 + 侧栏菜单：浏览器半区与宿主是两份实现，只能靠文本契约对齐 ────
+//
+// 「隐藏了功能」要同时落在三处：设置页写配置、工作台 / 侧栏菜单按它渲染、
+// 宿主工具面按它拒绝。前两处在这里钉，第三处在 verify-tools 的第 6.7 节。
+{
+  const clientText = readFileSync(fileURLToPath(new URL("../src/client.ts", import.meta.url)), "utf8");
+  const linksText = readFileSync(fileURLToPath(new URL("../src/links.ts", import.meta.url)), "utf8");
+  const hostToolText = readFileSync(fileURLToPath(new URL("../src/tools.ts", import.meta.url)), "utf8");
+
+  // 模块 key 必须两边一致：宿主按 links.ts 的 STUDIO_MODULES 收敛 hiddenModules，
+  // 浏览器半区（经典脚本，不能 import）只能复制一份，写错就是「隐藏了但没生效」。
+  // 只取 `make_MODULES()` 那张表——阶段表（STAGES / TILE_STAGES / IMAGE_MODES…）
+  // 也是 `{ key: "…" }` 的形状，全局匹配会把它们一起卷进来。
+  const modulesBlock = (clientText.match(/function make_MODULES\(\) \{[\s\S]*?return \[([\s\S]*?)\n\s*\];/) ?? [])[1] ?? "";
+  const clientModuleKeys = [...modulesBlock.matchAll(/\{ key: "(\w+)", title: T\("/g)].map((match) => match[1]);
+  const hostModuleKeys = ((linksText.match(/STUDIO_MODULES = \[([^\]]+)\]/) ?? [])[1] ?? "")
+    .match(/"(\w+)"/g)
+    ?.map((piece) => piece.replaceAll('"', "")) ?? [];
+  check(
+    "浏览器半区的模块 key 与宿主 STUDIO_MODULES 一致",
+    clientModuleKeys.length >= 5 && JSON.stringify(clientModuleKeys) === JSON.stringify(hostModuleKeys),
+    `${clientModuleKeys.join("、")} vs ${hostModuleKeys.join("、")}`
+  );
+
+  // 设置页写配置的那一笔：字段名与宿主 tools.ts / index.ts 读的名字必须一样。
+  check(
+    "设置页把 hiddenModules 写回宿主",
+    /patch\(\{ hiddenModules: next \}\)/.test(clientText) && /publishHiddenModules\(next\)/.test(clientText)
+  );
+  check("宿主配置层认识这个字段", /hiddenModules/.test(readFileSync(fileURLToPath(new URL("../src/config.ts", import.meta.url)), "utf8")));
+  check("宿主网关允许保存这个字段", /"hiddenModules"/.test(readFileSync(fileURLToPath(new URL("../src/index.ts", import.meta.url)), "utf8")));
+  check("宿主工具面按模块拦调用", /assertModuleVisible/.test(hostToolText) && /METHOD_MODULE/.test(hostToolText));
+
+  // 工作台页签与侧栏菜单都必须按可见性过滤，而不是照旧渲染全部模块。
+  check("工作台页签按可见性过滤", /visibleModules\.map\(/.test(clientText));
+  check("侧栏菜单按可见性过滤", /const entries = visibleModulesOf\(hidden\);/.test(clientText));
+  check("工作台在选中模块被隐藏时落到第一个可见模块", /const activeModule =/.test(clientText) && /visibleModules\[0\]\.key/.test(clientText));
+
+  // 细节样式缺了不会报错，只会「看着不对劲」，所以把关键类名也钉住。
+  for (const className of [
+    "SPR_railGlyph",
+    "SPR_railMenuBtn",
+    "SPR_railMenu",
+    "SPR_railMenuItem",
+    "SPR_featureRow",
+    "SPR_featureCheck",
+    "SPR_modulesHiddenNote"
+  ]) {
+    check(`浏览器半区：有 ${className} 的样式`, new RegExp(`\\.${className}\\{`).test(clientText));
+  }
+}
+
+console.log("");
+if (failures.length > 0) {
+  console.error(`失败 ${failures.length} 项：${failures.join("、")}`);
+  console.error("阶段渲染函数少拿到 ctx 键时，界面渲染看不出来，只有点按钮才会报 TypeError。请把调用点补齐。");
+  console.error("宿主任务 key / targets 对不上时同样看不出来，只是批量任务中途会退回空态。请把两边对齐。");
+  process.exit(1);
+}
+
+console.log(`共 ${checks} 项检查，全部通过。`);
+
+/**
+ * 骨骼动画模块的文本契约。
+ *
+ * 浏览器半区是经典脚本，不能 import 宿主的常量，两边只能靠**同名文本**对齐：
+ * 模块 key、深链接白名单、远程方法名、四个阶段标题。任一侧改名都会让这里失败。
+ */
+function checkRigContracts(text, label) {
+  check(`${label}：注册了 RigModule`, text.includes("function RigModule"));
+  check(`${label}：模块导航含骨骼动画生成`, text.includes("骨骼动画生成"));
+  check(`${label}：AI模块保留结果校对标识`, text.includes("experimental: true") && text.includes('T("AI需校对")'));
+  check(`${label}：模块入口不再自动弹开发提示`, !text.includes("h(RigExperimentalDialog") && !text.includes("h(TileExperimentalDialog") && !text.includes("experimentalGateMuted ="));
+  check(`${label}：工作流说明不阻挡操作`, text.includes("function ModuleWorkflowGuide") && text.includes('h("details"') && text.includes('T("查看操作步骤")'));
+  check(`${label}：骨骼模块有内联操作说明`, text.includes('h(ModuleWorkflowGuide, { moduleKey: "rig"'));
+  check(`${label}：地块模块有内联操作说明`, text.includes('h(ModuleWorkflowGuide, { moduleKey: "tile"'));
+  check(`${label}：空骨骼任务可直接上传创建`, text.includes('"data-testid": "rig-start-form"') && text.includes('T("创建并导入角色")'));
+  check(`${label}：空地块项目可直接导入创建`, text.includes('"data-testid": "tile-start-form"') && text.includes('T("创建并导入地形")'));
+  {
+    // 模块集合从宿主清单派生：写死个数的话，加一个模块这里必然漏（历史教训）
+    const linksSource = readFileSync(fileURLToPath(new URL("../src/links.ts", import.meta.url)), "utf8");
+    const hostKeys = ((linksSource.match(/STUDIO_MODULES = \[([^\]]+)\]/) ?? [])[1] ?? "")
+      .match(/"(\w+)"/g)
+      ?.map((piece) => piece.replaceAll('"', "")) ?? [];
+    const wanted = hostKeys.map((key) => `"${key}"`).join(", ");
+    check(`${label}：深链接允许全部 ${hostKeys.length} 个模块`, text.includes(`new Set([${wanted}])`), wanted);
+  }
+  for (const method of [
+    "listRigJobs",
+    "createRigJob",
+    "getRigJob",
+    "deleteRigJob",
+    "saveRigJob",
+    "uploadRigSource",
+    "uploadRigPart",
+    "removeRigPart",
+    "renameRigPart",
+    "setRigPartVisibility",
+    "saveRigLayoutItem",
+    "runRigSheet",
+    "runRigSegment",
+    "runRigLayout",
+    "runRigBones",
+    "runRigAtlas"
+  ]) {
+    check(`${label}：声明了远程方法 ${method}`, text.includes(`["${method}"`));
+  }
+  check(
+    `${label}：四个阶段标题齐全`,
+    ["① 拆件", "② 装配定位", "③ 骨骼与动画", "④ 图集"].every((entry) => text.includes(entry))
+  );
+  check(`${label}：装配结果可拖动微调`, text.includes("SPR_rigBox"));
+  // 手动装配编辑器：拖拽 / 缩放 / 键盘 / 吸附 / 撤销 / 图层 / 部件栏，缺一样就是残的。
+  for (const [feature, token] of [
+    ["画布是客户端自己叠的分层", ".SPR_asmLayer"],
+    ["选中后有缩放手柄", ".SPR_asmHandle"],
+    ["未放置部件有部件栏（可拖进画布）", ".SPR_asmPalette"],
+    ["有图层列表", ".SPR_asmLayers"],
+    ["有对齐参考线", ".SPR_asmGuide"],
+    ["键盘方向键微调", "ArrowLeft"],
+    ["Delete 收回部件", "Delete"],
+    ["Ctrl/Cmd+Z 撤销", 'toLowerCase() === "z"'],
+    ["吸附开关", "吸附"],
+    ["锁等比开关", "锁等比"],
+    ["撤销/重做", "重做"],
+    ["参考图做底图对位", "参考图底图"],
+    ["图层置顶置底", "置顶"],
+    ["滚轮缩放（以光标为锚）", "zoomAt"],
+    ["空格/中键拖动平移", "data-panning"],
+    ["Ctrl/Cmd+0 适应窗口", 'event.key === "0"']
+  ]) {
+    check(`${label}：手动装配有${feature}`, text.includes(token));
+  }
+  // 滚轮缩放必须用**非被动**监听：React 的 onWheel 是被动注册的，在里面
+  // preventDefault 无效（浏览器照旧滚动，还会打警告），缩放会被页面滚动吃掉。
+  check(
+    `${label}：滚轮监听是非被动的`,
+    text.includes('addEventListener("wheel"') && text.includes("{ passive: false }"),
+    ""
+  );
+  // 画布居中必须用 margin:auto，不能靠父级 justify-content:center——
+  // 后者在「内容比容器宽」时会裁掉左侧且滚不到，一放大就够不着左边那块。
+  check(
+    `${label}：画布用 margin:auto 居中（放大后左边够得着）`,
+    /\.SPR_asmCanvas\{[^}]*margin:auto/.test(text),
+    /\.SPR_asmCanvas\{([^}]*)\}/.exec(text)?.[1]?.slice(0, 80) ?? ""
+  );
+  // 舞台高度必须是固定的。用 max-height 让它被内容撑着的话，一缩放面板就跟着
+  // 长高（实测 100% 时 605px、176% 时 681px），画面抽动、光标锚点也算不准。
+  check(
+    `${label}：装配舞台高度固定（缩放时面板不抽动）`,
+    /\.SPR_asmStage\{[^}]*height:70vh/.test(text) && !/\.SPR_asmStage\{[^}]*max-height:70vh/.test(text),
+    /\.SPR_asmStage\{([^}]*)\}/.exec(text)?.[1]?.slice(0, 90) ?? ""
+  );
+  // 两条导出路径都必须能在界面上拿到：Spine 的 skeleton.json / .atlas 是主路径，
+  // DragonBones 的 _ske.json / _tex.json 是给 Cocos / Egret / Laya 用的第二条。
+  // 宿主已经返回了这两组字段，界面不渲染就等于「产物生成了但用户不知道去哪拿」。
+  check(
+    `${label}：③ 阶段给出 DragonBones 骨架链接`,
+    text.includes('data-testid": "rig-bones-db"') && text.includes("job.rig?.dragonBones?.skeleton"),
+    "缺少 rig-bones-db 区块"
+  );
+  check(
+    `${label}：④ 阶段逐页给出 DragonBones 贴图描述`,
+    text.includes('data-testid": "rig-atlas-db"') && text.includes("job.atlas.dragonBones.map"),
+    "缺少 rig-atlas-db 区块"
+  );
+  // 时间轴编辑器（M3）：动画从「参数」变成「可编辑数据」的界面落点。
+  for (const [feature, token] of [
+    ["时间轴面板", 'data-testid": "rig-timeline"'],
+    ["关键帧轨道", 'data-testid": "rig-tl-track"'],
+    ["选中帧的编辑区", 'data-testid": "rig-tl-edit"'],
+    ["播放/擦洗之外还能加轨道", '`rig-tl-add-${kind}`'],
+    ["缩放轨道（scale 轨道是 M3 新增的）", '["rotate", "translate", "scale"]'],
+    ["还原到预设", 'data-testid": "rig-tl-revert"'],
+    ["缓动预设按钮", '`rig-tl-ease-${preset.id}`'],
+    ["拖动关键帧（松手才提交）", "dragRef"]
+  ]) {
+    check(`${label}：时间轴有${feature}`, text.includes(token), token);
+  }
+  // 拆件质检面板：**装配之前**就该告诉用户「这批拆件能不能信」。
+  check(
+    `${label}：有拆件质检面板`,
+    text.includes('data-testid": "rig-qa"') && text.includes("job.qa"),
+    "缺少 rig-qa 面板"
+  );
+  check(
+    `${label}：质检支持重跑与「参考图大约几个部位」`,
+    text.includes('data-testid": "rig-qa-rerun"') && text.includes('data-testid": "rig-qa-expected"'),
+    "缺少质检操作入口"
+  );
+  check(
+    `${label}：质检面板列出 message 与 suggestion`,
+    text.includes("issue.suggestion") && text.includes("SPR_qaFix"),
+    "建议没渲染出来"
+  );
+  // IK 约束编辑器（M5）：约束在这里设、拖动在预览页做。
+  for (const [feature, token] of [
+    ["IK 约束面板", 'data-testid": "rig-constraints"'],
+    ["选链末端骨骼", 'data-testid": "rig-ik-bone"'],
+    ["加约束", 'data-testid": "rig-ik-add"'],
+    ["切换弯曲方向", "rig-ik-bend-"],
+    ["软 IK 权重", "weight: entry.weight"],
+    ["删单条约束", "rig-ik-del-"],
+    ["清空全部", 'data-testid": "rig-ik-clear"']
+  ]) {
+    check(`${label}：约束编辑器有${feature}`, text.includes(token), token);
+  }
+  // 蒙皮网格与 FFD 面板（M5）：网格与变形都在这里调，一键入口给「让裙摆飘起来」。
+  for (const [feature, token] of [
+    ["蒙皮面板", 'data-testid": "rig-mesh"'],
+    ["选部件", 'data-testid": "rig-mesh-pick"'],
+    ["细分部件", 'data-testid": "rig-mesh-add"'],
+    ["一键给裙摆加飘动", 'data-testid": "rig-mesh-skirt"'],
+    ["逐部件加飘动", "rig-mesh-wave-"],
+    ["改固定端", "rig-mesh-anchor-"],
+    ["取消单个网格", "rig-mesh-del-"],
+    ["清空全部网格", 'data-testid": "rig-mesh-clear"']
+  ]) {
+    check(`${label}：蒙皮面板有${feature}`, text.includes(token), token);
+  }
+  // Path 面板（M5）：选末端骨 + 链长，默认路径沿部件的近端锚点生成。
+  for (const [feature, token] of [
+    ["Path 面板", 'data-testid": "rig-paths"'],
+    ["选末端骨", 'data-testid": "rig-path-tip"'],
+    ["加路径", 'data-testid": "rig-path-add"'],
+    ["逐条删除", "rig-path-del-"],
+    ["清空全部", 'data-testid": "rig-path-clear"'],
+    // 位置必须取自 layout.items——parts 只有尺寸没有坐标，拿它算会得到 NaN。
+    ["从 layout.items 取坐标", "job.layout?.items?.[name]"]
+  ]) {
+    check(`${label}：Path 面板有${feature}`, text.includes(token), token);
+  }
+  // 日志面板（M7）：级别筛选 + 关键字 + 把「开始 X」与「X 完成」配成一条并附耗时。
+  for (const [feature, token] of [
+    ["日志面板", 'data-testid": "rig-log"'],
+    ["级别筛选（全部/警告+/错误）", 'data-testid": "rig-log-warn"'],
+    ["关键字搜索", 'data-testid": "rig-log-query"'],
+    ["配对耗时展示", "SPR_logElapsed"],
+    ["按级别计数", "counts.error"]
+  ]) {
+    check(`${label}：日志面板有${feature}`, text.includes(token), token);
+  }  // 撤销/重做的两处时序陷阱，都是实测撞出来的：  //  ① 把 setHistory([]) 挂在 [job.id, job.updatedAt] 上 —— commit 自己就会改
+  //     updatedAt，于是每提交一次就清空撤销栈，撤销按钮永远是灰的；
+  //  ② undo 把「改动前」的快照塞进重做栈 —— 重做还原的还是改动前那份，点了没反应。
+  check(
+    `${label}：清空撤销栈只跟着任务 id，不跟着 updatedAt`,
+    /setHistory\(\[\]\)[\s\S]{0,80}?\}, \[job\.id\]\)/.test(text),
+    "把 setHistory([]) 和 setDraft({}) 拆成两个 effect：前者只依赖 job.id"
+  );
+  check(
+    `${label}：撤销时先把当前状态抓进重做栈`,
+    /const undo = \(\) => \{[\s\S]{0,400}?captureSnapshot\(Object\.keys\(last\)\)/.test(text),
+    "undo 里要 captureSnapshot 当前状态再 applySnapshot(last)"
+  );
+  check(`${label}：骨骼预览内联在 iframe 里`, text.includes("SPR_rigPreview"));
+  check(`${label}：低置信度部件有提示`, text.includes("相似度偏低"));
+  // 面板根必须自己是滚动容器。SPR_root 是定高 flex 列，子元素默认不滚动，
+  // 内容一多就被裁掉——实测表现是「骨骼动画生成这一页没法下滑」。
+  check(
+    `${label}：骨骼动画面板自带滚动`,
+    /\.SPR_rigPanel\{[^}]*overflow:auto/.test(text),
+    /\.SPR_rigPanel\{([^}]*)\}/.exec(text)?.[1] ?? "(找不到 .SPR_rigPanel)"
+  );
+
+  // 最容易漏的一条：REMOTE_METHODS 只是「向宿主声明方法名」，真正的方法体要
+  // 在下面那个 api 对象里逐条挂上去。只加声明不加实现，界面一点就报
+  // “api.xxx is not a function”——编译期完全看不出来（api 是隐式 any）。
+  const declared = [...text.matchAll(/\["([A-Za-z0-9_]+)",\s*(?:true|false)\]/g)].map((m) => m[1]);
+  const unique = [...new Set(declared)];
+  // 实现侧的判据是「出现了 call("方法名")」，与缩进无关（src 与打包后的 lib 缩进不同）。
+  const missing = unique.filter((name) => !text.includes(`call("${name}"`));
+  check(
+    `${label}：REMOTE_METHODS 的每个方法都有 api 实现（共 ${unique.length} 个）`,
+    missing.length === 0,
+    missing.length === 0 ? "" : `缺实现：${missing.join("、")}`
+  );
+  check(
+    `${label}：远程 codec 提供 create() 工厂`,
+    text.includes('mode: "strict"') && /create:\s*\(\)\s*=>/.test(text) && !text.includes("schema: { parse:"),
+    "strict codec 要有 create()，宿主会调用 codec.create().parse()"
+  );
+  // 「从部件栏拖进画布」必须由**它自己**那个 mouseup 收尾，不能被更早注册的
+  // 移动/缩放 mouseup 抢走：那个 effect 先跑、把 drag 置空，React 同步重渲染后
+  // 就把后面的监听器当清理函数摘掉了——实测表现是拖进去毫无反应、撤销也不亮。
+  check(
+    `${label}：移动/缩放 effect 不吞「拖进画布」`,
+    /drag\.kind !== "move"\s*&&\s*drag\.kind !== "resize"/.test(text) && /drag\.kind !== "place"/.test(text),
+    "移动/缩放 mouseup 必须过滤 kind，否则 place 拖放不生效"
+  );
+  // 本地草稿写的是 `placed`（操作意图），而图层显隐/已放置计数读的是 `matched`
+  // （宿主也是读 placed 写 matched 的）。合并时不把两个键对齐，Delete 收回、
+  // 部件栏拖入这类纯本地改动就要等宿主回包才看得见——通信一失败界面就一动不动，
+  // 实测会被当成「整个手动装配是坏的」。
+  check(
+    `${label}：本地草稿把 placed 折算成 matched`,
+    /matched:\s*local\.placed !== false/.test(text),
+    "items 合并处必须由 placed 推导 matched"
+  );
+  check(
+    `${label}：生成类调用都带 loading 文案`,
+    [
+      /runRigSheet\s*\(/,
+      /runRigSegment\s*\(/,
+      /runRigLayout\s*\(/,
+      /runRigBones\s*\(/,
+      /runRigAtlas\s*\(/
+    ].every((pattern) => pattern.test(text))
+  );
+}
+
+/**
+ * 「转圈截帧」的文本契约（阶段①的默认生成方式）。
+ *
+ * 这一块坏了界面照样渲染，只是功能静默失效，所以逐条钉住：
+ *   - 方法名与宿主对不上 → 点了报 “api.xxx is not a function”；
+ *   - 轴上的圆圈不是可聚焦按钮 / 没有方向键微调 → 鼠标拖歪一次就没法精确调；
+ *   - 圆圈位置公式与宿主的截帧下标不是同一套 → 拖了看着对、切出来是别的帧。
+ */
+function checkTurnContracts(text, label) {
+  check(`${label}：有转圈截帧面板`, text.includes("function TurnImageStage"));
+  check(`${label}：有八圆圈时间轴`, text.includes("function TurnAxis") && text.includes("SPR_axisDot"));
+  check(
+    `${label}：轴上有八个可拖动的圆圈`,
+    /DIRECTION_KEYS\.map\(\(key\) => \{/.test(text) &&
+      text.includes("onPointerDown") &&
+      text.includes("onPointerMove") &&
+      text.includes("onPointerUp")
+  );
+  check(`${label}：圆圈支持方向键微调`, /event\.key !== "ArrowLeft" && event\.key !== "ArrowRight"/.test(text));
+  check(
+    `${label}：圆圈位置按「格心」换算（与宿主的下标一致）`,
+    /\(index \+ 0\.5\) \/ Math\.max\(1, total\)/.test(text) && /Math\.round\(fraction \* total - 0\.5\)/.test(text)
+  );
+  check(`${label}：轴上带整圈缩略条带`, text.includes("SPR_axisStrip"));
+  check(
+    `${label}：两种生成方式的切换在界面上`,
+    text.includes("function ImageModeBar") && text.includes("setImageMode") && text.includes("IMAGE_MODES")
+  );
+  check(
+    `${label}：抽帧期间八个方向都被盖住`,
+    /jobCovers\(hostFrames, key\)/.test(text) && text.includes('hostJob(project, "turn:frames")')
+  );
+  check(`${label}：候选帧数可调（8~64）`, text.includes("TURN_FRAME_MIN") && text.includes("TURN_FRAME_MAX"));
+  check(`${label}：转圈模式的产物仍写进 images/<方向>.png（下游不必知道）`, /stage: "images"/.test(text) && text.includes("turn-dot-"));
+}
+
+
+/**
+ * 三个实测问题的文本契约：
+ *   ① 数字输入框必须「失焦/回车才提交」（边打字边提交会被宿主 clamp 回写，数字乱跳）；
+ *   ② 序列帧缩略图双击要能看大图，大图窗口右上角有关闭按钮；
+ *   ③ 阶段④ 要说明「为什么第 3 步抠过一次、这里还抠」。
+ */
+function checkFramePickContracts(text, label) {
+  check(
+    `${label}：序列帧支持按视频手动选帧`,
+    text.includes("手动选帧") && text.includes("function FramePickAxis") && text.includes("function FramePickPanel")
+  );
+  check(
+    `${label}：手动选帧走独立的候选帧接口`,
+    text.includes("prepareFramePick") && text.includes("setFramePick") && text.includes("resetFramePicks")
+  );
+}
+
+/**
+ * 后台轮询不许覆盖用户正在输入的草稿。
+ *
+ * 真机反馈：「这个提示词是无法替换的呀，我替换的时候它一秒钟又换回来。」
+ * 根因：有任务在跑时界面每 2.5~5 秒 `load()` 一次，无条件拿宿主的值整份覆盖草稿。
+ * 修法是 `mergeDrafts`（只有「草稿 === 上一次宿主值」的字段才跟着宿主走），
+ * 换项目 / 点「重置为默认」才整份替换。这里钉住四个模块的 load 都真的走它。
+ */
+function checkDraftContracts(text, label) {
+  check(
+    `${label}：草稿合并只更新用户没动过的字段`,
+    /function mergeDrafts\(current, previous, next, force\)/.test(text) &&
+      /drafted === undefined \|\| sameDraft\(drafted, previous\?\.\[key\]\) \? next\[key\] : drafted/.test(text)
+  );
+  check(
+    `${label}：模块① 的视频提示词不再被轮询覆盖`,
+    /setVideoPromptDraft\(\(current\) => mergeDrafts\(current, previous\.video, video, force\)\)/.test(text) &&
+      /setPromptDraft\(\(current\) => mergeDrafts\(current, previous\.images, images, force\)\)/.test(text) &&
+      !/setVideoPromptDraft\(next\.prompts\?\.video \?\? ""\)/.test(text)
+  );
+  check(
+    `${label}：模块① 换项目/重置时才整份替换草稿`,
+    /const force = options\.resetDrafts === true \|\| previous\.projectId !== id;/.test(text) &&
+      /resetDrafts: true, notice: T\("提示词已重置为默认模板"\)/.test(text) &&
+      /await loadProject\(projectId, \{ resetDrafts: options\.resetDrafts === true \}\)/.test(text)
+  );
+  check(
+    `${label}：模块②③④ 的提示词/参数草稿同样走合并`,
+    /setPromptDraft\(\(current\) => mergeDrafts\(current, previous\.prompt, next\.prompt \?\? "", force\)\)/.test(text) &&
+      /setSettingsDraft\(\(current\) => mergeDrafts\(current, previous\.settings, settings, force\)\)/.test(text) &&
+      /setPromptDraft\(\(current\) => mergeDrafts\(current, previous\.prompt, prompt, force\)\)/.test(text)
+  );
+  check(
+    `${label}：切换任务时才把草稿整份换成宿主的`,
+    /const force = previous\.id !== id;/.test(text) && !/setSuffixDraft\(next\.suffix \?\? ""\)/.test(text)
+  );
+}
+
+function checkInputAndZoomContracts(text, label) {
+  check(
+    `${label}：数字框在失焦/回车时才提交`,
+    /onBlur:\s*\(\)\s*=>\s*\{\s*setFocused\(false\);\s*commit\(\);\s*\}/.test(text) &&
+      /if \(event\.key === "Enter"\)/.test(text)
+  );
+  check(
+    `${label}：数字框的输入值走本地草稿，不在 onChange 里直接提交`,
+    /const \[text, setText\] = React\.useState\(String\(value \?\? ""\)\)/.test(text) &&
+      /onChange: \(event\) => setText\(event\.target\.value\)/.test(text) &&
+      !/const next = Number\(event\.target\.value\)/.test(text)
+  );
+  // 文案已经i18n化：源码里是 `title: T("双击看大图")`，但保留未包装的写法也接受
+  // （词条表本身、以及将来可能不做翻译的位置）。
+  check(
+    `${label}：有双击看大图的组件`,
+    text.includes("function ZoomableImage") && /title: (?:T\()?"双击看大图"/.test(text)
+  );
+  check(
+    `${label}：大图窗口有关闭按钮 + Esc + 点背景关闭`,
+    /className: "SPR_zoomClose"/.test(text) &&
+      /event\.key === "Escape"/.test(text) &&
+      /className: "SPR_zoomMask"/.test(text) &&
+      /\.SPR_zoomMask\{[^}]*position:fixed/.test(text)
+  );
+  check(
+    `${label}：序列帧预览带可双击看大图`,
+    /className: "SPR_thumb",\s*\n?\s*src: assetUrl\(project, node\.strip/.test(text.replace(/\s+/g, " "))
+  );
+  check(`${label}：序列帧任务的逐帧缩略图也可双击放大`, /className: "SPR_frame"/.test(text) && /ZoomableImage/.test(text));
+  check(
+    `${label}：阶段④ 解释了两次抠像的分工`,
+    /两次读的是同一份帧缓存/.test(text) && /抠像在这里会\*\*再跑一次\*\*/.test(text)
+  );
+
+  // 内置默认提示词存在宿主侧，而宿主拿不到 locale 服务——语言必须由浏览器半区带过去，
+  // 否则切到英文后提示词还是中文。少一处就静默失效，只有真去切一次语言才看得出来。
+  check(
+    `${label}：读项目时把界面语言带给宿主`,
+    /getProject: \(projectId\) => call\("getProject", \{ projectId, lang: activeLang\(\) \}\)/.test(text)
+  );
+  check(
+    `${label}：保存/重置提示词时也带上界面语言`,
+    /savePrompts: \(payload\) => call\("savePrompts", \{ lang: activeLang\(\), \.\.\.payload \}\)/.test(text)
+  );
+  check(
+    `${label}：activeLang 认得出 en 并把其它语言算作 zh`,
+    // lib/ 是 tsc 的产物，类型标注（`: "zh" | "en"`）会被抹掉——两种写法都要认。
+    /function activeLang\(\s*\)?(?::\s*"zh"\s*\|\s*"en")?\s*\{/.test(text) && /startsWith\("en"\) \? "en" : "zh"/.test(text)
+  );
+  check(
+    `${label}：语言切换会重新拉一次项目（提示词才会跟着换）`,
+    /\}, \[projectId, loadProject, localeTick\]\);/.test(text) && /const localeTick = useLocaleTick\(\);/.test(text)
+  );
+}

@@ -1,0 +1,65 @@
+# Dependencies and runtime state
+node_modules/
+/data/
+/workspaces/
+/storage/
+/cache/
+/.cache/
+
+# Personal inputs, generated media, test outputs and old distributions
+/测试的素材/
+/test-results/
+/artifacts/
+/outputs/
+/exports/
+/backups/
+/backup/
+*.log
+*.tmp
+*.temp
+*.bak
+*.old
+*.tsbuildinfo
+*.tgz
+*.zip
+*.7z
+*.rar
+*.tar
+*.tar.gz
+
+# Credentials and local configuration (examples may be committed)
+.env
+.env.*
+!.env.example
+!.env.sample
+.npmrc
+!.npmrc.example
+**/.credentials*
+**/auth.json
+**/cookies.json
+**/cookies.txt
+**/storage-state*.json
+**/storageState*.json
+**/config.local.*
+**/settings.local.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# lib/ and public/ are intentionally committed: required by DSH distribution.
+# Keep package-lock.json, third-party LICENSE files and the project image skill.

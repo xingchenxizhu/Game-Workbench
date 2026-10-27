@@ -1,0 +1,3721 @@
+/**
+ * 骨骼动画生成模块（第四个物料模块）。
+ *
+ * 把参考项目 [spine-animation-ai](https://github.com/GenielabsOpenSource/spine-animation-ai)
+ * 的整条 Python 流水线搬进插件，并且**拆成可单独重跑的四个阶段**——参考项目是一条
+ * 跑到底的脚本，任何一步出问题都只能从头再来；这里每一步都有自己的状态、验收打标
+ * 与单独重跑入口，和八方向图模块的手感保持一致。
+ *
+ * ```
+ * ① parts  拆件   ：生图模型把角色拆成部件 → 连通域分割 → 逐件透明 PNG
+ *                   （也可以跳过生图，直接上传现成的部件 PNG）
+ * ② layout 装配   ：多尺度模板匹配把每个部件摆回参考图 → 合成对比图供肉眼验收
+ * ③ rig    骨骼   ：自动推骨骼层级 + 六个动画预设 → skeleton.json + 自包含预览
+ * ④ atlas  图集   ：打包成 Spine 纹理图集（.png + .atlas），可直接导入引擎
+ * ```
+ *
+ * 目录结构：
+ *   <DSH_HOME>/game-material-master/rig-jobs/<任务 id>/
+ *     job.json          任务状态（本文件的 RigJob）
+ *     source/           用户上传的角色参考图
+ *     sheet/            生图模型产出的「拆件摊平图」
+ *     parts/            分割后的部件透明 PNG
+ *     layout/           装配结果：layout.json / composite.png / comparison.png
+ *     rig/              skeleton.json / preview.html
+ *     atlas/            skeleton.png / skeleton.atlas
+ */
+import { mkdir, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { basename, join, resolve, sep } from "node:path";
+import { randomUUID } from "node:crypto";
+import { zipEntries } from "./zip.js";
+import { solveLayoutAsync, disposeLayoutWorkers } from "./riglayoutasync.js";
+import { loadConfig, rigJobsRoot } from "./config.js";
+import { assertImageProviderReady, generateImageWithProvider, imageModelOf, imageProviderBlocker, imageSizeOf, imageTimeoutOf, imageWatermarkOf, imageUsesConfiguredSize, imageRedrawModelOf } from "./imageprovider.js";
+import { decodeToRgba, mimeOf, toDataUri } from "./media.js";
+import { encodePng } from "./png.js";
+import { appendJobLog, messageOf, readJson, writeJsonAtomic } from "./jsonio.js";
+import { safeName, sniffImage } from "./imagegen.js";
+import { alphaBounds, blitRgba, boxMask, compositeParts, createRgba, detectBackground, erodeAlpha, groupComponentsByProximity, imageStats, maskAndFit, padToSquare, resizeRgba, rotateRgba, segmentWithLabels, sideBySide, tintRgba } from "./rigpose.js";
+import { DEFAULT_DRAW_ORDER, RIG_ANIMATIONS, RIG_GRID_COLUMNS, RIG_GRID_ROWS, animationDurationOf, animationPresetOf, buildAtlasText, buildSkeleton, defaultAnimationIds, defaultPartNames, drawRankOf, instantiateAnimation, isAnimationId, keyframeValueKeys, normalizeAnimationSettings, packAtlas, partLabel, rigSlotOf } from "./spine.js";
+import { buildPreviewHtml } from "./rigpreview.js";
+import { buildDragonBonesSkeleton, buildDragonBonesTexture } from "./rigexport.js";
+import { assessParts } from "./rigqa.js";
+import { MESH_DEFAULT_DIVISIONS, MESH_MAX_DIVISIONS } from "./rigmesh.js";
+import { normalizePath } from "./rigpath.js";
+import { validateAnimationLoops, validateAtlas, validateDragonBones, validateDragonBonesTexture, validateSkeletonAtlasMatch, validateSpineWire } from "./rigvalidate.js";
+import { defaultSemanticsOf, mergeSemantics, validateSemantics, ROLE_NOUNS } from "./rigsemantics.js";
+import { assetBasePath } from "./links.js";
+export const RIG_STAGES = [
+    { key: "parts", label: "① 拆件", summary: "把角色拆成独立部件（头/躯干/四肢），逐件透明 PNG" },
+    { key: "layout", label: "② 装配", summary: "把部件摆回参考姿态，出合成对比图供肉眼验收" },
+    { key: "rig", label: "③ 骨骼动画", summary: "自动推骨骼层级 + 待机/行走/奔跑/挥手/跳跃/攻击" },
+    { key: "atlas", label: "④ 图集", summary: "打包 Spine 纹理图集，可直接导入引擎" }
+];
+/** 单页纹理的边长上限；超过就分页。4096 是移动端 GPU 最普遍的保证值。 */
+export const ATLAS_MAX_SIZE = 4096;
+const JOB_ID_PATTERN = /^r[a-z0-9]{4,40}$/;
+export function rigJobDir(id) {
+    return join(rigJobsRoot(), id);
+}
+function jobFile(id) {
+    return join(rigJobDir(id), "job.json");
+}
+/** 任务内相对路径 → 绝对路径，并挡住目录穿越。 */
+export function rigAssetPath(id, relative) {
+    const base = resolve(rigJobDir(id));
+    const target = resolve(base, relative);
+    if (target !== base && !target.startsWith(base + sep))
+        throw new Error(`非法的任务内路径：${relative}`);
+    return target;
+}
+export function isValidRigJobId(id) {
+    return JOB_ID_PATTERN.test(id);
+}
+export async function ensureRigJobLayout(id) {
+    for (const sub of ["source", "sheet", "parts", "layout", "rig", "atlas"]) {
+        await mkdir(join(rigJobDir(id), sub), { recursive: true });
+    }
+}
+// ── 拆件提示词 ──────────────────────────────────────────────────────────
+/**
+ * 拆件提示词。
+ *
+ * 参考项目直接把「把所有部件摊开」交给模型，然后靠连通域分割，部件叫什么全靠
+ * 事后猜。这里额外要求模型**按严格网格摆放**：格子位置 = 部件身份，是确定事实，
+ * 于是「头」真的是头，骨骼层级和动画预设才能自动套上去，而不必让用户手工命名
+ * 十几个文件。
+ *
+ * 底下那三条硬约束是**用真实数据换来的**。拿一张真实立绘跑出来过：
+ * 18 块里 6 块是同一部位重画（4 段大腿、4 只鞋、3 条袖子）、标着 `hip` 的格子画的是
+ * 裙子、标着 `neck` 的画的是大腿、两条「左右袖」同向重合 0.901（应该是镜像）。
+ * 根因都在提示词没说清：
+ *
+ *   ① 只说「一格一件」，没说「每件必须不同」——于是模型把同一块内容画了很多遍；
+ *   ② 只给了格子名（`hip`/`neck`），没给部位描述——模型对这些短名字的理解与我们的
+ *      骨骼语义不一致，而骨架是靠「名字 → 语义」推的，名字错了骨架从第一根骨头起就错；
+ *   ③ 没有说明「参考图里被衣服遮住的部位要按解剖结构补全」——模型看不到大腿，
+ *      就把小腿反复画成「大腿」交差。
+ */
+export function buildSheetPrompt(columns, rows, names) {
+    const grid = [];
+    for (let row = 0; row < rows; row++) {
+        const cells = [];
+        for (let column = 0; column < columns; column++) {
+            const index = row * columns + column;
+            const name = names[index];
+            const slot = name === undefined ? undefined : rigSlotOf(name);
+            cells.push(slot === undefined ? (name ?? "-") : `${slot.name} = ${slot.en}`);
+        }
+        grid.push(`row ${row + 1}: ${cells.join(" | ")}`);
+    }
+    return [
+        "A flat 2D game sprite sheet for skeletal (Spine) cut-out animation, showing the EXACT same character as the reference image, completely taken apart into separate body parts.",
+        "",
+        `The image is a SQUARE canvas divided into an even ${columns} × ${rows} grid of equal cells. Each cell contains exactly ONE detached body part, centered in its cell. Cells in reading order — the text before the "=" is the part's name, the text after it says what that part IS:`,
+        ...grid,
+        "",
+        "Hard requirements:",
+        "- the canvas is square and the grid lines are perfectly even; every cell is the same size;",
+        "- exactly one body part per cell, and nothing else in that cell;",
+        "- **every cell shows a DIFFERENT part. Draw each body part exactly ONCE in the whole image.** Never repeat the same part in a second cell. The character has exactly two arms, two hands, two legs and two feet — never draw a third one;",
+        "- **draw what the cell says.** A cell labelled `neck` shows a neck, not a thigh or a leg. If a name seems ambiguous, follow the description after the \"=\";",
+        "- **CUT, do not redesign.** Every piece must look exactly like the corresponding region of the reference image: same garment, same colours, same silhouette, same proportions. The cell name only tells you *which body region to cut out*; the reference image tells you what it *looks like*. If the hip region is covered by a skirt in the reference image, the `hip` cell shows that skirt — never invent clothing that is not in the reference image (no shorts, no different outfit);",
+        "- **left and right parts are MIRRORED, not copies.** `left-upper-arm` and `right-upper-arm` must face opposite ways (one mirrored copy of the other), and the same for every other left/right pair;",
+        "- every part is COMPLETELY DETACHED: upper arm and forearm and hand are three separate pieces, never joined; upper leg, lower leg and foot are three separate pieces, never joined;",
+        "- no piece crosses a cell boundary, no piece touches or overlaps another piece;",
+        "- generous empty white space around every piece;",
+        "- parts are NOT assembled: no standing character, no connected body;",
+        "- CRITICAL: identical art style, identical shading, identical face, identical colours and identical proportions as the reference image;",
+        "- plain solid pure white background everywhere, flat 2D game asset, character part sheet;",
+        "",
+        "Negative: assembled body, connected limbs, joined arm, joined leg, overlapping parts, duplicated part, repeated part, three arms, three legs, extra limb, wrong part in cell, mismatched cell content, grid lines drawn, borders, labels, text, watermark, drop shadows, gradients, background scenery, 3D, realistic, redesigned character, different face, different colours."
+    ].join("\n");
+}
+export function buildSheetRequest(job) {
+    const base = job.prompts.sheet.trim() === "" ? buildSheetPrompt(job.settings.gridColumns, job.settings.gridRows, rigSlotNames(job)) : job.prompts.sheet;
+    const suffix = job.prompts.suffix.trim();
+    return suffix === "" ? base : `${base}\n${suffix}`;
+}
+/** 网格槽位名：优先用用户已经存在的部件名，否则用默认 16 件套。 */
+export function rigSlotNames(job) {
+    const defaults = defaultPartNames();
+    const count = job.settings.gridColumns * job.settings.gridRows;
+    const out = [];
+    for (let i = 0; i < count; i++)
+        out.push(defaults[i] ?? `slot-${i + 1}`);
+    return out;
+}
+// ── 持久化 ──────────────────────────────────────────────────────────────
+export async function createRigJob(name) {
+    const config = await loadConfig();
+    const id = `r${Date.now().toString(36)}${randomUUID().slice(0, 6)}`;
+    const now = Date.now();
+    const job = {
+        id,
+        name: name.trim() === "" ? "未命名骨骼动画任务" : name.trim().slice(0, 80),
+        createdAt: now,
+        updatedAt: now,
+        prompts: { sheet: "", suffix: "" },
+        settings: {
+            model: imageModelOf(config),
+            size: imageSizeOf(config),
+            watermark: imageWatermarkOf(config),
+            gridColumns: RIG_GRID_COLUMNS,
+            gridRows: RIG_GRID_ROWS,
+            backgroundTolerance: 30,
+            feather: 26,
+            minArea: 0,
+            partPadding: 4,
+            matchLongEdge: 448,
+            animations: defaultAnimationIds()
+        },
+        sheet: { status: "empty" },
+        parts: [],
+        layout: { status: "empty", items: {} },
+        rig: { status: "empty" },
+        atlas: { status: "empty" },
+        log: []
+    };
+    await ensureRigJobLayout(id);
+    await writeJsonAtomic(jobFile(id), job);
+    return job;
+}
+export async function readRigJob(id) {
+    if (!isValidRigJobId(id))
+        return undefined;
+    const raw = await readJson(jobFile(id));
+    if (raw === undefined)
+        return undefined;
+    return normalizeRigJob(raw);
+}
+export async function writeRigJob(job) {
+    job.updatedAt = Date.now();
+    await writeJsonAtomic(jobFile(job.id), job);
+}
+export async function listRigJobs() {
+    const { readdir } = await import("node:fs/promises");
+    let entries = [];
+    try {
+        const dirents = await readdir(rigJobsRoot(), { withFileTypes: true });
+        entries = dirents.filter((d) => d.isDirectory() && isValidRigJobId(d.name)).map((d) => d.name);
+    }
+    catch {
+        return [];
+    }
+    const out = [];
+    for (const id of entries) {
+        const job = await readRigJob(id);
+        if (job === undefined)
+            continue;
+        out.push(summarizeRigJob(job));
+    }
+    out.sort((a, b) => b.updatedAt - a.updatedAt);
+    return out;
+}
+export function summarizeRigJob(job) {
+    return {
+        id: job.id,
+        name: job.name,
+        createdAt: job.createdAt,
+        updatedAt: job.updatedAt,
+        hasSource: job.source !== undefined,
+        partCount: job.parts.filter((part) => part.status === "ready").length,
+        placedCount: Object.values(job.layout.items).filter((item) => item.matched).length,
+        rigReady: job.rig.status === "ready",
+        atlasReady: job.atlas.status === "ready"
+    };
+}
+export async function deleteRigJob(id) {
+    stopRigPoller(id);
+    await rm(rigJobDir(id), { recursive: true, force: true });
+}
+export async function rigJobExists(id) {
+    try {
+        return (await stat(rigJobDir(id))).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
+function num(value, fallback) {
+    const n = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
+    return Number.isFinite(n) ? n : fallback;
+}
+function clampInt(value, fallback, min, max) {
+    return Math.min(max, Math.max(min, Math.round(num(value, fallback))));
+}
+function normalizeRigJob(raw) {
+    const parts = Array.isArray(raw?.parts)
+        ? raw.parts
+            .filter((part) => typeof part?.name === "string")
+            .map((part) => ({
+            name: String(part.name),
+            label: typeof part.label === "string" ? part.label : partLabel(String(part.name)),
+            status: (part.status ?? "empty"),
+            file: typeof part.file === "string" ? part.file : undefined,
+            width: Number.isFinite(part.width) ? part.width : undefined,
+            height: Number.isFinite(part.height) ? part.height : undefined,
+            gridX: Number.isFinite(part.gridX) ? part.gridX : undefined,
+            gridY: Number.isFinite(part.gridY) ? part.gridY : undefined,
+            opacity: Number.isFinite(part.opacity) ? part.opacity : undefined,
+            source: part.source === "uploaded" ? "uploaded" : "generated",
+            approved: part.approved === true,
+            hidden: part.hidden === true,
+            error: typeof part.error === "string" ? part.error : undefined,
+            updatedAt: Number.isFinite(part.updatedAt) ? part.updatedAt : undefined,
+            role: typeof part.role === "string" && part.role !== "" ? part.role : undefined,
+            parent: part.parent === null ? null : typeof part.parent === "string" && part.parent !== "" ? part.parent : undefined,
+            proximal: Array.isArray(part.proximal) && part.proximal.length === 2 ? [num(part.proximal[0], 0.5), num(part.proximal[1], 0)] : undefined,
+            distal: Array.isArray(part.distal) && part.distal.length === 2 ? [num(part.distal[0], 0.5), num(part.distal[1], 1)] : undefined,
+            tags: Array.isArray(part.tags) ? part.tags.filter((tag) => typeof tag === "string") : undefined,
+            semanticsSource: part.semanticsSource === "ai" || part.semanticsSource === "human" ? part.semanticsSource : part.semanticsSource === "default" ? "default" : undefined,
+            versions: Array.isArray(part.versions)
+                ? part.versions
+                    .filter((item) => typeof item?.file === "string" && Number.isFinite(item?.v))
+                    .map((item) => ({
+                    v: num(item.v, 1),
+                    file: String(item.file),
+                    width: num(item.width, 0),
+                    height: num(item.height, 0),
+                    source: item.source === "upload" || item.source === "tint" || item.source === "redraw"
+                        ? item.source
+                        : "generated",
+                    note: typeof item.note === "string" ? item.note : undefined,
+                    createdAt: num(item.createdAt, Date.now())
+                }))
+                : undefined,
+            activeTexture: Number.isFinite(part.activeTexture) ? part.activeTexture : undefined
+        }))
+            // 建完立刻对齐一次：`file/width/height` 永远是当前生效版本的镜像，
+            // 于是既有代码（装配/骨骼/图集/预览/资源路由）都不需要知道版本的存在。
+            .map((part) => {
+            syncActiveTexture(part);
+            return part;
+        })
+        : [];
+    const items = {};
+    const rawItems = raw?.layout?.items;
+    if (rawItems !== null && typeof rawItems === "object") {
+        for (const [name, value] of Object.entries(rawItems)) {
+            items[name] = {
+                x: num(value?.x, 0),
+                y: num(value?.y, 0),
+                width: Math.max(1, num(value?.width, 1)),
+                height: Math.max(1, num(value?.height, 1)),
+                scale: num(value?.scale, 1),
+                rotation: num(value?.rotation, 0),
+                z: num(value?.z, 0),
+                score: Number.isFinite(value?.score) ? value.score : undefined,
+                coverage: Number.isFinite(value?.coverage) ? value.coverage : undefined,
+                matched: value?.matched !== false,
+                manual: value?.manual === true
+            };
+        }
+    }
+    const animations = Array.isArray(raw?.settings?.animations)
+        ? raw.settings.animations.filter((value) => isAnimationId(value))
+        : [];
+    return {
+        id: String(raw?.id ?? ""),
+        name: typeof raw?.name === "string" && raw.name.trim() !== "" ? raw.name : "未命名骨骼动画任务",
+        createdAt: num(raw?.createdAt, Date.now()),
+        updatedAt: num(raw?.updatedAt, Date.now()),
+        source: typeof raw?.source?.file === "string"
+            ? {
+                file: raw.source.file,
+                name: String(raw.source.name ?? basename(raw.source.file)),
+                width: num(raw.source.width, 0),
+                height: num(raw.source.height, 0)
+            }
+            : undefined,
+        prompts: {
+            sheet: typeof raw?.prompts?.sheet === "string" ? raw.prompts.sheet : "",
+            suffix: typeof raw?.prompts?.suffix === "string" ? raw.prompts.suffix : ""
+        },
+        settings: {
+            model: typeof raw?.settings?.model === "string" ? raw.settings.model : "",
+            size: typeof raw?.settings?.size === "string" ? raw.settings.size : "2K",
+            watermark: raw?.settings?.watermark === true,
+            gridColumns: clampInt(raw?.settings?.gridColumns, RIG_GRID_COLUMNS, 1, 8),
+            gridRows: clampInt(raw?.settings?.gridRows, RIG_GRID_ROWS, 1, 8),
+            backgroundTolerance: clampInt(raw?.settings?.backgroundTolerance, 30, 1, 200),
+            feather: clampInt(raw?.settings?.feather, 26, 1, 200),
+            minArea: clampInt(raw?.settings?.minArea, 0, 0, 100000),
+            partPadding: clampInt(raw?.settings?.partPadding, 4, 0, 64),
+            matchLongEdge: clampInt(raw?.settings?.matchLongEdge, 448, 128, 1024),
+            animations: animations.length > 0 ? animations : defaultAnimationIds()
+        },
+        sheet: {
+            status: (raw?.sheet?.status ?? "empty"),
+            file: typeof raw?.sheet?.file === "string" ? raw.sheet.file : undefined,
+            width: Number.isFinite(raw?.sheet?.width) ? raw.sheet.width : undefined,
+            height: Number.isFinite(raw?.sheet?.height) ? raw.sheet.height : undefined,
+            error: typeof raw?.sheet?.error === "string" ? raw.sheet.error : undefined,
+            approved: raw?.sheet?.approved === true,
+            updatedAt: Number.isFinite(raw?.sheet?.updatedAt) ? raw.sheet.updatedAt : undefined
+        },
+        parts,
+        layout: {
+            status: (raw?.layout?.status ?? "empty"),
+            approved: raw?.layout?.approved === true,
+            error: typeof raw?.layout?.error === "string" ? raw.layout.error : undefined,
+            composite: typeof raw?.layout?.composite === "string" ? raw.layout.composite : undefined,
+            comparison: typeof raw?.layout?.comparison === "string" ? raw.layout.comparison : undefined,
+            hint: Number.isFinite(raw?.layout?.hint) ? raw.layout.hint : undefined,
+            meanScore: Number.isFinite(raw?.layout?.meanScore) ? raw.layout.meanScore : undefined,
+            suggestedOrder: Array.isArray(raw?.layout?.suggestedOrder) ? raw.layout.suggestedOrder.map(String) : undefined,
+            moved: Array.isArray(raw?.layout?.moved) ? raw.layout.moved.map(String) : undefined,
+            resolved: Array.isArray(raw?.layout?.resolved) ? raw.layout.resolved.map(String) : undefined,
+            items,
+            hints: normalizeHints(raw?.layout?.hints),
+            updatedAt: Number.isFinite(raw?.layout?.updatedAt) ? raw.layout.updatedAt : undefined
+        },
+        rig: {
+            status: (raw?.rig?.status ?? "empty"),
+            approved: raw?.rig?.approved === true,
+            error: typeof raw?.rig?.error === "string" ? raw.rig.error : undefined,
+            skeleton: typeof raw?.rig?.skeleton === "string" ? raw.rig.skeleton : undefined,
+            preview: typeof raw?.rig?.preview === "string" ? raw.rig.preview : undefined,
+            bones: Number.isFinite(raw?.rig?.bones) ? raw.rig.bones : undefined,
+            slots: Number.isFinite(raw?.rig?.slots) ? raw.rig.slots : undefined,
+            animations: Array.isArray(raw?.rig?.animations) ? raw.rig.animations.map(String) : undefined,
+            warnings: Array.isArray(raw?.rig?.warnings) ? raw.rig.warnings.map(String) : undefined,
+            boneList: Array.isArray(raw?.rig?.boneList)
+                ? raw.rig.boneList
+                    .filter((bone) => typeof bone?.name === "string")
+                    .map((bone) => ({
+                    name: String(bone.name),
+                    parent: typeof bone.parent === "string" ? bone.parent : undefined,
+                    x: num(bone.x, 0),
+                    y: num(bone.y, 0),
+                    rotation: num(bone.rotation, 0),
+                    length: num(bone.length, 0),
+                    offset: pruneBoneOffset(bone.offset)
+                }))
+                : undefined,
+            // 同源的第二条导出路径（DragonBones 5.5）。
+            dragonBones: typeof raw?.rig?.dragonBones?.skeleton === "string" ? { skeleton: raw.rig.dragonBones.skeleton } : undefined,
+            updatedAt: Number.isFinite(raw?.rig?.updatedAt) ? raw.rig.updatedAt : undefined
+        },
+        atlas: {
+            status: (raw?.atlas?.status ?? "empty"),
+            approved: raw?.atlas?.approved === true,
+            error: typeof raw?.atlas?.error === "string" ? raw.atlas.error : undefined,
+            image: typeof raw?.atlas?.image === "string" ? raw.atlas.image : undefined,
+            text: typeof raw?.atlas?.text === "string" ? raw.atlas.text : undefined,
+            width: Number.isFinite(raw?.atlas?.width) ? raw.atlas.width : undefined,
+            height: Number.isFinite(raw?.atlas?.height) ? raw.atlas.height : undefined,
+            regions: Number.isFinite(raw?.atlas?.regions) ? raw.atlas.regions : undefined,
+            pages: Array.isArray(raw?.atlas?.pages)
+                ? raw.atlas.pages
+                    .filter((page) => typeof page?.file === "string")
+                    .map((page) => ({
+                    file: String(page.file),
+                    width: num(page.width, 0),
+                    height: num(page.height, 0),
+                    regions: num(page.regions, 0)
+                }))
+                : undefined,
+            warnings: Array.isArray(raw?.atlas?.warnings) ? raw.atlas.warnings.map(String) : undefined,
+            // DragonBones 贴图描述（逐页一份），与 `.atlas` 同一次装箱出来。
+            dragonBones: Array.isArray(raw?.atlas?.dragonBones?.textures)
+                ? { textures: raw.atlas.dragonBones.textures.filter((file) => typeof file === "string").map(String) }
+                : undefined,
+            updatedAt: Number.isFinite(raw?.atlas?.updatedAt) ? raw.atlas.updatedAt : undefined
+        },
+        reviewMode: raw?.reviewMode === "manual" ? "manual" : raw?.reviewMode === "auto" ? "auto" : undefined,
+        boneOffsets: normalizeBoneOffsets(raw?.boneOffsets),
+        animationSettings: normalizeAnimationSettings(raw?.animationSettings),
+        // 手工动画：读盘时也过一遍归一化（比写入时更宽松——老文件可能是手改的）。
+        animations: (() => {
+            const input = raw?.animations;
+            if (input === null || typeof input !== "object")
+                return undefined;
+            const out = {};
+            for (const [id, value] of Object.entries(input)) {
+                if (!isAnimationId(id))
+                    continue;
+                const ignored = [];
+                const parsed = normalizeCustomAnimation(value, { duration: animationDurationOf(id, {}), loop: true }, ignored);
+                if (parsed !== undefined)
+                    out[id] = parsed;
+            }
+            return Object.keys(out).length === 0 ? undefined : out;
+        })(),
+        qa: normalizeQaState(raw?.qa),
+        constraints: normalizeConstraints(raw?.constraints),
+        meshes: normalizeMeshes(raw?.meshes),
+        deforms: normalizeDeforms(raw?.deforms),
+        paths: normalizePaths(raw?.paths),
+        log: Array.isArray(raw?.log) ? raw.log.slice(-200) : []
+    };
+}
+/**
+ * 读盘时的 IK 约束归一化。
+ *
+ * 骨架那一侧还有一道更严的校验（`validateSpineWire`），这里只保证「读得出来、
+ * 字段类型对」——盘上的数据可能是手改的，不能让一条写坏的约束把整个任务卡死。
+ */
+function normalizeConstraints(raw) {
+    if (!Array.isArray(raw))
+        return undefined;
+    const out = [];
+    for (const entry of raw) {
+        if (entry === null || typeof entry !== "object")
+            continue;
+        const value = entry;
+        if (typeof value.name !== "string" || value.name === "")
+            continue;
+        if (typeof value.bone !== "string" || value.bone === "")
+            continue;
+        out.push({
+            type: "ik",
+            name: value.name,
+            bone: value.bone,
+            target: typeof value.target === "string" && value.target !== "" ? value.target : `${value.name}-target`,
+            chain: Math.max(1, Math.min(8, Math.round(num(value.chain, 1)))),
+            bendPositive: value.bendPositive !== false,
+            weight: Math.max(0, Math.min(1, num(value.weight, 1)))
+        });
+    }
+    return out.length === 0 ? undefined : out;
+}
+/**
+ * 读盘时的蒙皮网格归一化。
+ *
+ * ⚠️ `normalizeRigJob` 是**白名单式**的：字段不在这里列出来就会被静默丢掉。
+ * 实测踩过——`setRigMesh` 明明写盘成功、日志也有记录，读回来却是 `undefined`，
+ * 表现是「加了网格但骨架里还是 region 附件」（排查时最容易怀疑错地方）。
+ */
+function normalizeMeshes(raw) {
+    if (raw === null || typeof raw !== "object")
+        return undefined;
+    const out = {};
+    for (const [name, value] of Object.entries(raw)) {
+        if (value === null || typeof value !== "object")
+            continue;
+        out[name] = {
+            cols: Math.max(1, Math.min(MESH_MAX_DIVISIONS, Math.round(num(value.cols, MESH_DEFAULT_DIVISIONS)))),
+            rows: Math.max(1, Math.min(MESH_MAX_DIVISIONS, Math.round(num(value.rows, MESH_DEFAULT_DIVISIONS))))
+        };
+    }
+    return Object.keys(out).length === 0 ? undefined : out;
+}
+/** 读盘时的 FFD 变形归一化（同上：白名单字段，漏了就会静默丢）。 */
+function normalizeDeforms(raw) {
+    if (raw === null || typeof raw !== "object")
+        return undefined;
+    const out = {};
+    for (const [name, value] of Object.entries(raw)) {
+        if (value === null || typeof value !== "object")
+            continue;
+        if (value.mode !== undefined && value.mode !== "wave")
+            continue;
+        out[name] = {
+            mode: "wave",
+            amplitude: Math.max(0, Math.min(400, num(value.amplitude, 0))),
+            cycles: Math.max(0.25, Math.min(8, num(value.cycles, 1))),
+            direction: num(value.direction, 0),
+            anchor: value.anchor === "bottom" || value.anchor === "none" ? value.anchor : "top",
+            duration: Math.max(0.1, Math.min(10, num(value.duration, 1.6)))
+        };
+    }
+    return Object.keys(out).length === 0 ? undefined : out;
+}
+/** 读盘时的 Path 约束归一化（同上：白名单字段，漏了就会静默丢）。 */
+function normalizePaths(raw) {
+    if (raw === null || typeof raw !== "object")
+        return undefined;
+    const out = {};
+    for (const [name, value] of Object.entries(raw)) {
+        if (value === null || typeof value !== "object")
+            continue;
+        const path = normalizePath(value);
+        if (path === undefined)
+            continue;
+        const bones = Array.isArray(value.bones) ? value.bones.filter((entry) => typeof entry === "string") : [];
+        if (bones.length === 0)
+            continue;
+        out[name] = {
+            points: path.points,
+            closed: path.closed,
+            bones,
+            spacing: Math.max(0, num(value.spacing, 0)),
+            translateMix: Math.max(0, Math.min(1, num(value.translateMix, 1))),
+            rotateMix: Math.max(0, Math.min(1, num(value.rotateMix, 1)))
+        };
+    }
+    return Object.keys(out).length === 0 ? undefined : out;
+}
+/** 读盘时的质检状态归一化：字段缺失/手改过都不该让整个任务读不出来。 */
+function normalizeQaState(raw) {
+    if (raw === null || typeof raw !== "object")
+        return undefined;
+    if (typeof raw.summary !== "string")
+        return undefined;
+    return {
+        ok: raw.ok === true,
+        score: num(raw.score, 0),
+        summary: raw.summary,
+        checked: num(raw.checked, 0),
+        duplicates: Array.isArray(raw.duplicates)
+            ? raw.duplicates
+                .filter((group) => Array.isArray(group?.parts))
+                .map((group) => ({
+                parts: group.parts.map(String),
+                minOverlap: num(group.minOverlap, 0),
+                mirroredOverlap: num(group.mirroredOverlap, 0),
+                symmetric: group.symmetric === true
+            }))
+            : [],
+        issues: Array.isArray(raw.issues)
+            ? raw.issues.map((issue) => ({
+                level: issue?.level === "error" ? "error" : "warning",
+                code: String(issue?.code ?? ""),
+                parts: Array.isArray(issue?.parts) ? issue.parts.map(String) : [],
+                message: String(issue?.message ?? ""),
+                suggestion: typeof issue?.suggestion === "string" ? issue.suggestion : undefined
+            }))
+            : [],
+        expectedParts: Number.isFinite(raw.expectedParts) ? raw.expectedParts : undefined,
+        updatedAt: Number.isFinite(raw.updatedAt) ? raw.updatedAt : Date.now()
+    };
+}
+// ── 对外视图 ────────────────────────────────────────────────────────────
+/**
+ * 任务视图：界面与对话工具用的是**同一份形状**。
+ *
+ * 这里刻意做成「原始任务 + 算好的派生字段」的超集：
+ *   - 界面需要原始字段（`settings` / `prompts` / `layout.items`）来编辑；
+ *   - 对话工具需要派生字段（每个产物的绝对 URL、逐阶段状态、未命中清单）。
+ * 两处各拼一份的话，字段名迟早会漂移——实测就踩过：界面按派生字段写、
+ * 网关却返回原始任务，结果按钮因为读不到 `sourceUrl` 一直是灰的。
+ *
+ * `origin` 为空时返回**相对路径**（浏览器直接用）；工具侧传 origin，
+ * 拿到的是可以直接贴给用户的绝对 URL。
+ */
+/**
+ * 递归丢掉 `undefined` 属性。
+ *
+ * 工具返回值必须是**无损 JSON**：`undefined` 一旦出现在对象里，序列化时会静默
+ * 丢掉那个键，宿主据此判定「结果不是无损 JSON」并直接让整个工具调用报错
+ * （实测表现是 `game_material({action:'status'})` / `game_material({action:'wait'})` / `getRigJob`
+ * 全部返回 `value is not lossless JSON`）。视图里有大量可选字段，逐个写
+ * `?? null` 太容易漏，统一在出口处清一遍。
+ */
+function lossless(value) {
+    if (Array.isArray(value))
+        return value.map((item) => lossless(item));
+    if (value !== null && typeof value === "object") {
+        const out = {};
+        for (const [key, item] of Object.entries(value)) {
+            if (item === undefined)
+                continue;
+            out[key] = lossless(item);
+        }
+        return out;
+    }
+    return value;
+}
+export function rigSnapshot(job, origin = "") {
+    const assetBase = `${origin}${assetBasePath(`/dsh-game-material-master/rig-assets/${job.id}/`)}`;
+    const url = (relative) => typeof relative === "string" && relative !== "" ? `${assetBase}${relative}` : undefined;
+    const items = job.layout.items;
+    const parts = job.parts.map((part) => {
+        const item = items[part.name];
+        return {
+            name: part.name,
+            label: part.label,
+            status: part.status,
+            source: part.source,
+            hidden: part.hidden === true,
+            approved: part.approved === true,
+            width: part.width,
+            height: part.height,
+            opacity: part.opacity,
+            gridX: part.gridX,
+            gridY: part.gridY,
+            file: part.file,
+            url: url(part.file),
+            placed: item !== undefined && item.matched === true,
+            manual: item?.manual === true,
+            score: item?.score,
+            coverage: item?.coverage,
+            error: part.error,
+            // 语义层：界面要能就地改，agent 要能读到「它认为这块是什么」。
+            role: part.role ?? null,
+            parent: part.parent ?? null,
+            proximal: part.proximal ?? null,
+            distal: part.distal ?? null,
+            tags: part.tags ?? [],
+            semanticsSource: part.semanticsSource ?? null,
+            // 贴图版本：界面要能在版本间切换（「这张 AI 头发不行，换回原版」）。
+            activeTexture: activeVersionOf(part)?.v ?? null,
+            versions: versionsOf(part).map((version) => ({
+                v: version.v,
+                file: version.file,
+                url: url(version.file),
+                width: version.width,
+                height: version.height,
+                source: version.source,
+                note: version.note ?? null,
+                createdAt: version.createdAt
+            }))
+        };
+    });
+    const stages = [
+        {
+            stage: "parts",
+            title: "① 拆件",
+            status: job.sheet.status,
+            approved: job.sheet.approved === true,
+            url: url(job.sheet.file),
+            file: job.sheet.file,
+            error: job.sheet.error,
+            partReady: parts.filter((part) => part.status === "ready").length
+        },
+        {
+            stage: "layout",
+            title: "② 装配定位",
+            status: job.layout.status,
+            approved: job.layout.approved === true,
+            composite: url(job.layout.composite),
+            comparison: url(job.layout.comparison),
+            hint: job.layout.hint ?? null,
+            meanScore: job.layout.meanScore ?? null,
+            hints: job.layout.hints ?? {},
+            moved: job.layout.moved ?? [],
+            resolved: job.layout.resolved ?? [],
+            unmatched: parts.filter((part) => part.status === "ready" && !part.placed).map((part) => part.name),
+            error: job.layout.error
+        },
+        {
+            stage: "rig",
+            title: "③ 骨骼与动画",
+            status: job.rig.status,
+            approved: job.rig.approved === true,
+            skeleton: url(job.rig.skeleton),
+            preview: url(job.rig.preview),
+            bones: job.rig.bones,
+            slots: job.rig.slots,
+            animations: job.rig.animations ?? [],
+            warnings: job.rig.warnings ?? [],
+            error: job.rig.error
+        },
+        {
+            stage: "atlas",
+            title: "④ 图集",
+            status: job.atlas.status,
+            approved: job.atlas.approved === true,
+            image: url(job.atlas.image),
+            text: url(job.atlas.text),
+            width: job.atlas.width,
+            height: job.atlas.height,
+            regions: job.atlas.regions,
+            error: job.atlas.error
+        }
+    ];
+    return lossless({
+        module: "rig",
+        id: job.id,
+        name: job.name,
+        /**
+         * 任务最后更新时间。客户端把它放在本地草稿的重置依赖里
+         * （`useEffect(..., [job.id, job.updatedAt])`）——缺了它，服务端状态变了
+         * 界面也不会清掉旧草稿，看起来就像「改了没反应」。
+         */
+        updatedAt: job.updatedAt,
+        reviewMode: job.reviewMode ?? null,
+        assetBase,
+        /**
+         * 任务目录的**本机绝对路径**。agent 要自己做视觉先验就得能直接看图，
+         * 而 read_image 之类只能读本机路径，给它 URL 没用。
+         */
+        dataDir: rigJobDir(job.id),
+        /** 「一眼看全部部件」的蒙太奇图（本机路径与 URL 都给）。 */
+        partsMontage: job.sheet.file === undefined ? null : "sheet/parts-montage.png",
+        partsMontageUrl: url("sheet/parts-montage.png"),
+        partsMontagePath: join(rigJobDir(job.id), "sheet/parts-montage.png"),
+        partsOrder: job.parts.map((part) => part.name),
+        sourcePath: job.source === undefined ? null : join(rigJobDir(job.id), job.source.file),
+        sourceFile: job.source?.file ?? null,
+        sourceUrl: url(job.source?.file),
+        canvas: job.source === undefined ? null : { width: job.source.width, height: job.source.height },
+        prompts: { sheet: job.prompts.sheet, suffix: job.prompts.suffix },
+        prompt: job.prompts.sheet,
+        suffix: job.prompts.suffix,
+        settings: job.settings,
+        /**
+         * 语义层的整体视图。
+         *
+         * 放在顶层而不是塞进某个阶段里，因为它是**装配与骨骼的共同输入**：
+         * 界面要在两个阶段都能看到「这块是什么、挂在谁身上」，agent 也要能拿到
+         * 「语义是否已经确认过、有没有结构问题」再决定下一步。
+         */
+        semantics: (() => {
+            const view = validateRigSemantics(job);
+            const ready = semanticPartsOf(job);
+            return {
+                ready: ready.length > 0 && ready.every((part) => part.role !== undefined),
+                confirmed: ready.length > 0 && ready.every((part) => part.semanticsSource === "human" || part.semanticsSource === "ai"),
+                count: ready.length,
+                ok: view.ok,
+                errors: view.errors,
+                warnings: view.warnings
+            };
+        })(),
+        // 拆件图阶段单独给一份，界面要直接拿 url 显示原图。
+        sheet: { status: job.sheet.status, approved: job.sheet.approved === true, url: url(job.sheet.file), file: job.sheet.file, error: job.sheet.error },
+        layout: {
+            status: job.layout.status,
+            approved: job.layout.approved === true,
+            error: job.layout.error,
+            items,
+            composite: url(job.layout.composite),
+            comparison: url(job.layout.comparison),
+            hint: job.layout.hint ?? null,
+            meanScore: job.layout.meanScore ?? null,
+            hints: job.layout.hints ?? {},
+            moved: job.layout.moved ?? [],
+            resolved: job.layout.resolved ?? []
+        },
+        rig: {
+            status: job.rig.status,
+            approved: job.rig.approved === true,
+            error: job.rig.error,
+            skeleton: url(job.rig.skeleton),
+            preview: url(job.rig.preview),
+            bones: job.rig.bones,
+            slots: job.rig.slots,
+            animations: job.rig.animations ?? [],
+            warnings: job.rig.warnings ?? [],
+            /**
+             * 上一次成功构建的骨骼表（含每根的手工偏移），界面用它画骨骼编辑器。
+             * 放在顶层 `rig` 而不是 `stages[]` 里：客户端读的是前者，
+             * 两个形状各拼一份的话字段名迟早会漂移（这个坑本项目以前踩过）。
+             */
+            boneList: job.rig.boneList ?? [],
+            /** DragonBones 5.5（`_ske.json`）：与 `skeleton` 同源的第二条导出路径。 */
+            dragonBones: { skeleton: url(job.rig.dragonBones?.skeleton) },
+            /**
+             * 产物更新时间。
+             *
+             * 客户端拿它给预览 iframe 做缓存破除（`?v=`）——少了它，改完关键帧 / 骨骼偏移后
+             * 重算产物，React 会认为 iframe 的 src 没变、不重新挂载，**预览一直是旧的**。
+             * 这是「改了没反应」里最难查的一种：数据全对，只是没人让浏览器重新去拉。
+             */
+            updatedAt: job.rig.updatedAt,
+            /** 手工偏移的**当前真源**：骨骼还没重跑时，界面上也要能看到自己调过什么。 */
+            boneOffsets: job.boneOffsets ?? {},
+            /**
+             * 动画参数与**生效后的时长**。
+             *
+             * `presets` 给界面渲染可调项（连同预设的原始时长，好显示「你把它从 1.6 改成 1.0」），
+             * `durations` 是本次实际会写进 skeleton.json 的时长。
+             */
+            animationSettings: job.animationSettings ?? {},
+            /**
+             * 已经被手工/AI 编辑过的动画 id。时间轴编辑器据此标「已改」与给「还原」按钮；
+             * 具体的关键帧数据走 `getRigAnimation` 按需取，不塞进每 2 秒轮询的快照里。
+             */
+            customAnimations: Object.keys(job.animations ?? {}),
+            /**
+             * IK 约束（M5）。
+             *
+             * 连同**自动补出来的目标骨**一起给：界面要显示「这个点可以拖」，
+             * 而目标骨不在部件表里，界面无从推断。
+             */
+            constraints: job.constraints ?? [],
+            constraintTargets: (job.constraints ?? []).map((entry) => entry.target),
+            /**
+             * 蒙皮网格与 FFD 变形（M5）。
+             *
+             * 一起给界面，是因为编辑面板必须能回答「这块细分了吗、现在摆幅多大」——
+             * 少一个字段，界面上那个滑杆就只能显示默认值，用户改完看不出到底存了什么。
+             */
+            meshes: job.meshes ?? {},
+            /** Path 约束：点仍是**参考图像素**，界面/脚本读它来显示与编辑。 */
+            paths: job.paths ?? {},
+            deforms: job.deforms ?? {},
+            animationPresets: RIG_ANIMATIONS.map((preset) => ({
+                id: preset.id,
+                label: preset.label,
+                summary: preset.summary,
+                loop: preset.loop,
+                defaultDuration: preset.duration,
+                duration: animationDurationOf(preset.id, job.animationSettings ?? {}),
+                amplitude: job.animationSettings?.[preset.id]?.amplitude ?? 1,
+                enabled: (job.settings.animations ?? []).includes(preset.id)
+            }))
+        },
+        atlas: {
+            status: job.atlas.status,
+            approved: job.atlas.approved === true,
+            error: job.atlas.error,
+            image: url(job.atlas.image),
+            text: url(job.atlas.text),
+            url: url(job.atlas.image),
+            width: job.atlas.width,
+            height: job.atlas.height,
+            regions: job.atlas.regions,
+            /** 多页图集（单页时只有一项）。界面要能逐页预览。 */
+            pages: job.atlas.pages ?? [],
+            /** DragonBones 贴图描述（`_tex.json`，逐页一份）：与 `.atlas` 同一次装箱的孪生兄弟。 */
+            dragonBones: (job.atlas.dragonBones?.textures ?? []).map((file) => ({ file, url: url(file) })),
+            /** 校验给出的提示（错误会让图集阶段直接失败，不会走到这里）。 */
+            warnings: job.atlas.warnings ?? []
+        },
+        busy: stages.some((stage) => stage.status === "running") || listRigTasks(job.id).length > 0,
+        stages,
+        parts,
+        /**
+         * 拆件质检：**装配之前**就该看的结论。
+         *
+         * 放在顶层而不是塞进某个阶段：它同时管「拆件可不可信」与「装配准不准」，
+         * 而这两件事分别属于①②两个阶段。`null` = 还没跑过（老任务）。
+         */
+        qa: job.qa ?? null,
+        review: {
+            parts: parts.filter((part) => part.status === "ready").length,
+            approved: parts.filter((part) => part.approved).length,
+            placed: parts.filter((part) => part.placed).length,
+            unmatched: parts.filter((part) => part.status === "ready" && !part.placed).map((part) => part.name),
+            errors: stages.filter((stage) => stage.status === "error").map((stage) => stage.stage)
+        },
+        runningTasks: listRigTasks(job.id),
+        log: job.log
+    });
+}
+// ── 素材上传 ────────────────────────────────────────────────────────────
+export async function setRigSource(jobId, name, base64) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const clean = base64.replace(/^data:[^;]+;base64,/, "");
+    const sniffed = sniffImage(clean);
+    if (sniffed === undefined)
+        throw new Error("无法识别的图片格式（支持 PNG / JPEG / WebP / BMP）");
+    const bytes = Buffer.from(clean, "base64");
+    if (bytes.length === 0)
+        throw new Error("图片数据为空");
+    if (bytes.length > 30 * 1024 * 1024)
+        throw new Error("参考图超过 30 MB，请先压缩后再上传");
+    const stem = safeName(name).replace(/\.[^.]+$/, "") || "character";
+    const relative = `source/${stem}.${sniffed.ext}`;
+    await mkdir(join(rigJobDir(jobId), "source"), { recursive: true });
+    await writeFile(rigAssetPath(jobId, relative), bytes);
+    const decoded = await decodeToRgba(rigAssetPath(jobId, relative), 2048);
+    job.source = { file: relative, name: safeName(name), width: decoded.width, height: decoded.height };
+    appendJobLog(job.log, "info", `已上传角色参考图：${safeName(name)}（${decoded.width}×${decoded.height}）`);
+    await writeRigJob(job);
+    return { width: decoded.width, height: decoded.height };
+}
+/** 导入已有拆件图，复用与AI输出完全相同的分割流程，不调用模型。 */
+export async function uploadRigSheet(jobId, name, base64) {
+    if (listRigTasks(jobId).length > 0)
+        throw new Error("骨骼任务仍在处理，请完成后再上传拆件图");
+    const active = new Set(["upload-sheet"]);
+    running.set(jobId, active);
+    try {
+        const job = await readRigJob(jobId);
+        if (job === undefined)
+            throw new Error(`任务不存在：${jobId}`);
+        const clean = base64.replace(/^data:[^;]+;base64,/, "");
+        const image = sniffImage(clean);
+        if (image === undefined)
+            throw new Error("无法识别拆件图（支持 PNG / JPEG / WebP / BMP）");
+        const bytes = Buffer.from(clean, "base64");
+        if (bytes.length === 0 || bytes.length > 30 * 1024 * 1024)
+            throw new Error("拆件图需小于30 MB且不能为空");
+        const file = `sheet/import-${randomUUID()}.${image.ext}`;
+        await mkdir(join(rigJobDir(jobId), "sheet"), { recursive: true });
+        await writeFile(rigAssetPath(jobId, file), bytes);
+        await decodeToRgba(rigAssetPath(jobId, file), 2048);
+        invalidateFrom(job, "sheet");
+        job.sheet = { status: "ready", file, updatedAt: Date.now() };
+        appendJobLog(job.log, "info", `已导入拆件图：${basename(name)}，开始本地分割`);
+        await writeRigJob(job);
+        await segmentSheet(jobId);
+        return { parts: (await readRigJob(jobId))?.parts.filter(part => part.status === "ready").length ?? 0 };
+    }
+    finally {
+        active.delete("upload-sheet");
+        if (active.size === 0)
+            running.delete(jobId);
+    }
+}
+/** 打包当前有效的骨架、全部图集页、DragonBones描述和自包含预览。 */
+export async function exportRigBundle(jobId) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (listRigTasks(jobId).length > 0)
+        throw new Error("骨骼任务仍在处理，请完成后再导出");
+    if (job.rig.status !== "ready" || job.atlas.status !== "ready" || !job.rig.skeleton || !job.atlas.text) {
+        throw new Error("请先完成骨骼与动画、纹理图集，再导出完整ZIP");
+    }
+    const entries = [];
+    const add = async (path, file) => entries.push({ path, data: await readFile(rigAssetPath(jobId, file)) });
+    await add("spine/skeleton.json", job.rig.skeleton);
+    await add("spine/skeleton.atlas", job.atlas.text);
+    const pages = job.atlas.pages?.map(page => page.file) ?? (job.atlas.image ? [job.atlas.image] : []);
+    if (pages.length === 0)
+        throw new Error("图集缺少纹理页，请重新打包");
+    for (const page of pages) {
+        await add(`spine/${basename(page)}`, page);
+        await add(`dragonbones/${basename(page)}`, page);
+    }
+    if (job.rig.dragonBones?.skeleton)
+        await add("dragonbones/skeleton_ske.json", job.rig.dragonBones.skeleton);
+    for (const file of job.atlas.dragonBones?.textures ?? [])
+        await add(`dragonbones/${basename(file)}`, file);
+    if (job.rig.preview)
+        await add("preview.html", job.rig.preview);
+    entries.push({ path: "manifest.json", data: Buffer.from(JSON.stringify({ format: "game-workbench-rig@1", name: job.name, animations: job.rig.animations, files: entries.map(entry => entry.path) }, null, 2)) });
+    entries.push({ path: "README.txt", data: Buffer.from("Spine 4.2: import spine/skeleton.json with skeleton.atlas and all PNG pages.\nDragonBones: load dragonbones/skeleton_ske.json with the texture JSON and PNG pages in the same directory.\nOpen preview.html for the local self-contained preview.\n") });
+    const bytes = zipEntries(entries);
+    const file = `export/rig-${Date.now()}-${randomUUID().slice(0, 8)}.zip`;
+    await mkdir(join(rigJobDir(jobId), "export"), { recursive: true });
+    await writeFile(rigAssetPath(jobId, file), bytes);
+    return { file, bytes: bytes.length };
+}
+/** 上传一张现成的部件 PNG（跳过生图拆件，直接进入装配）。 */
+export async function uploadRigPart(jobId, name, base64) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const clean = base64.replace(/^data:[^;]+;base64,/, "");
+    const sniffed = sniffImage(clean);
+    if (sniffed === undefined)
+        throw new Error("无法识别的图片格式（支持 PNG / JPEG / WebP / BMP）");
+    const bytes = Buffer.from(clean, "base64");
+    if (bytes.length === 0)
+        throw new Error("图片数据为空");
+    if (bytes.length > 30 * 1024 * 1024)
+        throw new Error("部件图超过 30 MB");
+    // 用文件名（去掉扩展名）当部件名：这是用户表达「这块是什么」的唯一通道，
+    // 骨骼层级完全依赖它。
+    const rawName = safeName(name).replace(/\.[^.]+$/, "");
+    const partName = (rawName === "" ? `part-${job.parts.length + 1}` : rawName).slice(0, 48);
+    await mkdir(join(rigJobDir(jobId), "parts"), { recursive: true });
+    // 统一落到临时文件再解码：上传的可能是 JPEG（部件目录要保持只有 PNG），
+    // 而且「新增一版」需要先拿到 RGBA 再编码。
+    const tempFile = join(rigJobDir(jobId), "parts", `.incoming-${Date.now()}.${sniffed.ext}`);
+    await writeFile(tempFile, bytes);
+    let decoded;
+    try {
+        decoded = await decodeToRgba(tempFile, 2048);
+    }
+    finally {
+        await rm(tempFile, { force: true }).catch(() => undefined);
+    }
+    const rgba = { data: decoded.rgba, width: decoded.width, height: decoded.height };
+    const existing = job.parts.find((part) => part.name === partName);
+    if (existing !== undefined) {
+        // **同名上传 = 顶掉当前贴图**，但是新增一个版本，不覆盖原图——
+        // 这正是方案里「手工上传替换」应有的手感：换错了随时切回来。
+        const created = await addTextureVersion(jobId, existing, { source: "upload", note: "手工上传", rgba });
+        invalidateFrom(job, "parts");
+        ensurePartSemantics(job);
+        appendJobLog(job.log, "info", `已上传「${partName}」的新贴图 v${created.v}（${created.width}×${created.height}）`);
+        await writeRigJob(job);
+        return { name: partName, width: created.width, height: created.height };
+    }
+    const relative = textureFileName(partName, 1);
+    await writeFile(rigAssetPath(jobId, relative), encodePng(rgba.data, rgba.width, rgba.height));
+    const node = {
+        name: partName,
+        label: partLabel(partName),
+        status: "ready",
+        file: relative,
+        width: rgba.width,
+        height: rgba.height,
+        source: "uploaded",
+        approved: false,
+        versions: [
+            {
+                v: 1,
+                file: relative,
+                width: rgba.width,
+                height: rgba.height,
+                source: "upload",
+                note: "手工上传",
+                createdAt: Date.now()
+            }
+        ],
+        activeTexture: 1,
+        updatedAt: Date.now()
+    };
+    job.parts.push(node);
+    // 部件变了，后面的阶段全部作废。
+    invalidateFrom(job, "parts");
+    // 新上传的部件补一次语义——文件名就是它唯一的语义线索（`head.png` → 头部），
+    // 其余字段按角色默认填上；用户之后可以只改不对的那几条。
+    ensurePartSemantics(job);
+    appendJobLog(job.log, "info", `已上传部件「${partName}」（${rgba.width}×${rgba.height}）`);
+    await writeRigJob(job);
+    return { name: partName, width: rgba.width, height: rgba.height };
+}
+export async function removeRigPart(jobId, name) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const node = job.parts.find((part) => part.name === name);
+    if (node === undefined)
+        throw new Error(`没有这个部件：${name}`);
+    job.parts = job.parts.filter((part) => part.name !== name);
+    delete job.layout.items[name];
+    // 它的**所有**贴图版本都要删掉，否则会在 parts/ 下留一堆孤儿文件。
+    for (const version of versionsOf(node)) {
+        await rm(rigAssetPath(jobId, version.file), { force: true }).catch(() => undefined);
+    }
+    // 别的部件的父级可能指向它；先摘掉再修复，避免留下悬空父级。
+    for (const other of job.parts)
+        if (other.parent === name)
+            other.parent = undefined;
+    // 它自己的手工偏移也一并清掉，否则会留下一条永远用不上的孤儿记录。
+    if (job.boneOffsets?.[name] !== undefined) {
+        const rest = { ...job.boneOffsets };
+        delete rest[name];
+        job.boneOffsets = Object.keys(rest).length === 0 ? undefined : rest;
+    }
+    invalidateFrom(job, "parts");
+    ensurePartSemantics(job);
+    appendJobLog(job.log, "info", `已删除部件「${name}」`);
+    await writeRigJob(job);
+}
+/**
+ * 给部件改名（拆件图没按网格摆时，用户需要手工把它命名成 head / torso / …）。
+ * 名字直接决定骨骼层级与动画能否套上，所以这里是主要的人工兜底通道。
+ */
+export async function renameRigPart(jobId, from, to) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const node = job.parts.find((part) => part.name === from);
+    if (node === undefined)
+        throw new Error(`没有这个部件：${from}`);
+    const name = to.trim().replace(/[^\w\-\u4e00-\u9fa5]/g, "-").slice(0, 48);
+    if (name === "")
+        throw new Error("部件名不能为空");
+    if (job.parts.some((part) => part.name === name && part.name !== from))
+        throw new Error(`已经有叫「${name}」的部件了`);
+    if (node.file !== undefined) {
+        // 改名要连**所有贴图版本**一起搬：只搬当前那一版的话，之后回退会指到
+        // 一个已经不存在的文件（而文件其实还在，只是名字对不上）。
+        const versions = versionsOf(node);
+        for (const version of versions) {
+            const target = textureFileName(name, version.v);
+            if (version.file === target)
+                continue;
+            await rename(rigAssetPath(jobId, version.file), rigAssetPath(jobId, target)).catch(() => undefined);
+            version.file = target;
+        }
+        node.versions = versions;
+        node.file = textureFileName(name, node.activeTexture ?? versions[versions.length - 1]?.v ?? 1);
+    }
+    if (job.layout.items[from] !== undefined) {
+        job.layout.items[name] = job.layout.items[from];
+        delete job.layout.items[from];
+    }
+    node.name = name;
+    node.label = partLabel(name);
+    // 改名会改变语义推断（`left-lower-arm` 与 `blob-3` 的角色完全不同），
+    // 所以把别人的父级引用改过来，再重算这一条的角色/锚点。
+    for (const other of job.parts)
+        if (other.parent === from)
+            other.parent = name;
+    // 手工骨骼偏移是按名字索引的，改名要跟着搬——否则用户改个名就「白调了」。
+    if (job.boneOffsets?.[from] !== undefined) {
+        const moved = { ...job.boneOffsets };
+        moved[name] = moved[from];
+        delete moved[from];
+        job.boneOffsets = moved;
+    }
+    node.role = undefined;
+    node.proximal = undefined;
+    node.distal = undefined;
+    node.semanticsSource = undefined;
+    // ⚠️ 只作废「骨骼与图集」，**不动装配结果**：改名改的是角色/父级/锚点，
+    // 而布局位置与名字无关。作废到 layout 会让用户白丢一次手工摆位。
+    invalidateFrom(job, "rig");
+    ensurePartSemantics(job);
+    appendJobLog(job.log, "info", `部件「${from}」已改名为「${name}」（语义已按新名字重算）`);
+    await writeRigJob(job);
+}
+export async function setRigPartVisibility(jobId, name, hidden) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const node = job.parts.find((part) => part.name === name);
+    if (node === undefined)
+        throw new Error(`没有这个部件：${name}`);
+    node.hidden = hidden;
+    invalidateFrom(job, "layout");
+    await writeRigJob(job);
+}
+export async function setRigPartApproved(jobId, name, approved) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    let touched = 0;
+    for (const part of job.parts) {
+        if (name === undefined || part.name === name) {
+            part.approved = approved;
+            touched++;
+        }
+    }
+    if (name !== undefined && touched === 0)
+        throw new Error(`没有这个部件：${name}`);
+    await writeRigJob(job);
+    return touched;
+}
+export async function setRigStageApproved(jobId, stage, approved) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (stage === "parts") {
+        job.sheet.approved = approved;
+        for (const part of job.parts)
+            if (part.status === "ready")
+                part.approved = approved;
+    }
+    else if (stage === "layout") {
+        job.layout.approved = approved;
+    }
+    else if (stage === "rig") {
+        job.rig.approved = approved;
+    }
+    else if (stage === "atlas") {
+        job.atlas.approved = approved;
+    }
+    else {
+        throw new Error(`未知阶段：${stage}`);
+    }
+    await writeRigJob(job);
+}
+export async function saveRigPrompts(jobId, patch) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (typeof patch.sheet === "string")
+        job.prompts.sheet = patch.sheet;
+    if (typeof patch.suffix === "string")
+        job.prompts.suffix = patch.suffix;
+    if (patch.resetSheet === true)
+        job.prompts.sheet = buildSheetPrompt(job.settings.gridColumns, job.settings.gridRows, rigSlotNames(job));
+    await writeRigJob(job);
+}
+export async function saveRigSettings(jobId, raw) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const before = { ...job.settings };
+    job.settings.gridColumns = clampInt(raw.gridColumns, job.settings.gridColumns, 1, 8);
+    job.settings.gridRows = clampInt(raw.gridRows, job.settings.gridRows, 1, 8);
+    job.settings.backgroundTolerance = clampInt(raw.backgroundTolerance, job.settings.backgroundTolerance, 1, 200);
+    job.settings.feather = clampInt(raw.feather, job.settings.feather, 1, 200);
+    job.settings.minArea = clampInt(raw.minArea, job.settings.minArea, 0, 100000);
+    job.settings.partPadding = clampInt(raw.partPadding, job.settings.partPadding, 0, 64);
+    job.settings.matchLongEdge = clampInt(raw.matchLongEdge, job.settings.matchLongEdge, 128, 1024);
+    job.settings.size = typeof raw.size === "string" && raw.size.trim() !== "" ? raw.size : job.settings.size;
+    job.settings.watermark = raw.watermark === true;
+    if (Array.isArray(raw.animations)) {
+        const list = raw.animations.filter((value) => isAnimationId(value));
+        job.settings.animations = list.length > 0 ? list : defaultAnimationIds();
+    }
+    // 分割参数改了，已经切出来的部件就作废；网格尺寸改了连摊平图都要重生成。
+    const segmentationChanged = before.backgroundTolerance !== job.settings.backgroundTolerance ||
+        before.feather !== job.settings.feather ||
+        before.minArea !== job.settings.minArea ||
+        before.partPadding !== job.settings.partPadding;
+    const gridChanged = before.gridColumns !== job.settings.gridColumns || before.gridRows !== job.settings.gridRows;
+    const animationsChanged = JSON.stringify(before.animations) !== JSON.stringify(job.settings.animations);
+    if (gridChanged || segmentationChanged)
+        invalidateFrom(job, "sheet");
+    else if (animationsChanged)
+        invalidateFrom(job, "rig");
+    await writeRigJob(job);
+    return { changed: gridChanged || segmentationChanged };
+}
+/**
+ * 让某个阶段**及其之后**的产物失效。
+ *
+ * 流水线的依赖是一条直线（拆件图 → 部件 → 装配 → 骨骼 → 图集），任何上游变化都会
+ * 让下游的产物对不上。这里集中处理，避免每个入口各写一遍、漏掉某一层。
+ *
+ * 两个阶段的处理**故意不同**：
+ *
+ * - **`layout` 保留 `items`，只取消「通过」**。装配结果里存的是**人的劳动**
+ *   （手工拖过的每一个位置），而「改一个先验」「隐藏一个部件」都只是让它需要重算——
+ *   顺手清空等于把用户摆好的位置一次抹掉。
+ * - **`rig` / `atlas` 直接置空**。它们是纯派生物（重跑就有），而改了骨骼偏移、
+ *   动画或语义之后它们确实是旧的：只清「通过」标记的话，界面继续显示「已完成」，
+ *   用户以为改动已经生效了（实测踩过：改完动画参数后 `rig.status` 仍是 `ready`）。
+ */
+const STAGE_ORDER = ["sheet", "parts", "layout", "rig", "atlas"];
+function invalidateFrom(job, stage) {
+    const from = STAGE_ORDER.indexOf(stage);
+    const at = (key) => STAGE_ORDER.indexOf(key);
+    if (from <= at("sheet")) {
+        // 拆件图要重画：生图切出来的部件全部作废，用户手工上传的保留。
+        job.parts = job.parts.filter((part) => part.source === "uploaded" && part.status === "ready");
+        job.sheet = { ...job.sheet, approved: false };
+    }
+    else {
+        for (const part of job.parts)
+            part.approved = false;
+    }
+    // 只有**上游**变了才谈得上清空装配结果（部件本身都换了，旧位置没有意义）。
+    if (from < at("layout"))
+        job.layout = { status: "empty", items: {} };
+    else
+        job.layout.approved = false;
+    if (from <= at("rig"))
+        job.rig = { status: "empty" };
+    if (from <= at("atlas"))
+        job.atlas = { status: "empty" };
+}
+// ── 后台任务 ────────────────────────────────────────────────────────────
+const running = new Map();
+const pollers = new Map();
+let disposed = false;
+export function disposeRig() {
+    disposeLayoutWorkers();
+    disposed = true;
+    for (const timer of pollers.values())
+        clearInterval(timer);
+    pollers.clear();
+    running.clear();
+}
+/** 复位后台任务表（理由同 pipeline.activatePipeline：重载会让 disposed 永远停在 true）。 */
+export function activateRig() {
+    disposed = false;
+    running.clear();
+}
+export function listRigTasks(jobId) {
+    return [...(running.get(jobId) ?? [])];
+}
+function kick(jobId, taskKey, fn) {
+    if (disposed)
+        return false;
+    const set = running.get(jobId) ?? new Set();
+    running.set(jobId, set);
+    if (set.has(taskKey))
+        return false;
+    set.add(taskKey);
+    void (async () => {
+        try {
+            await fn();
+        }
+        catch (error) {
+            const job = await readRigJob(jobId);
+            if (job !== undefined) {
+                appendJobLog(job.log, "error", `${taskKey} 失败：${messageOf(error)}`);
+                await writeRigJob(job);
+            }
+        }
+        finally {
+            set.delete(taskKey);
+            if (set.size === 0)
+                running.delete(jobId);
+        }
+    })();
+    return true;
+}
+function assertIdle(jobId, taskKey, what) {
+    if (running.get(jobId)?.has(taskKey) === true)
+        throw new Error(`${what}已在进行中，请等它跑完`);
+}
+/** 生图任务要轮询，占位保持接口形状（当前只在任务内轮询，不需要外部驱动）。 */
+export function stopRigPoller(jobId) {
+    const timer = pollers.get(jobId);
+    if (timer !== undefined)
+        clearInterval(timer);
+    pollers.delete(jobId);
+}
+// ── 贴图版本（阶段⑦）────────────────────────────────────────────────────
+/** 某个部件的版本列表；老任务没有这个字段时按「当前文件就是 v1」合成一份。 */
+export function versionsOf(part) {
+    if (Array.isArray(part.versions) && part.versions.length > 0)
+        return part.versions;
+    if (part.file === undefined)
+        return [];
+    return [
+        {
+            v: 1,
+            file: part.file,
+            width: part.width ?? 0,
+            height: part.height ?? 0,
+            source: part.source === "uploaded" ? "upload" : "generated",
+            createdAt: part.updatedAt ?? Date.now()
+        }
+    ];
+}
+export function activeVersionOf(part) {
+    const versions = versionsOf(part);
+    if (versions.length === 0)
+        return undefined;
+    const wanted = part.activeTexture;
+    return versions.find((item) => item.v === wanted) ?? versions[versions.length - 1];
+}
+/**
+ * 把当前生效版本镜像到 `part.file` / `width` / `height`。
+ *
+ * **这是整套版本机制能向后兼容的关键**：所有既有代码（装配、骨骼、图集、
+ * 预览、资源路由）读的仍然是 `part.file`，它们完全不需要知道版本的存在。
+ */
+function syncActiveTexture(part) {
+    const active = activeVersionOf(part);
+    if (active === undefined)
+        return;
+    part.versions = versionsOf(part);
+    part.activeTexture = active.v;
+    part.file = active.file;
+    part.width = active.width;
+    part.height = active.height;
+}
+function textureFileName(name, version) {
+    // v1 沿用旧命名，这样已存在的任务与文件不用搬家。
+    return version <= 1 ? `parts/${name}.png` : `parts/${name}.v${version}.png`;
+}
+/**
+ * 追加一个版本并把它设为当前生效。
+ *
+ * 三种来源共用这一条路径（换色 / 重绘 / 手工上传），所以「回退」的实现只有一份，
+ * 而且任何一版都**不会被覆盖**——这是「这张不行换回原版」能零成本做到的前提。
+ */
+async function addTextureVersion(jobId, part, input) {
+    const versions = versionsOf(part);
+    const nextVersion = versions.reduce((max, item) => Math.max(max, item.v), 0) + 1;
+    const relative = textureFileName(part.name, nextVersion);
+    await mkdir(join(rigJobDir(jobId), "parts"), { recursive: true });
+    await writeFile(rigAssetPath(jobId, relative), encodePng(input.rgba.data, input.rgba.width, input.rgba.height));
+    const version = {
+        v: nextVersion,
+        file: relative,
+        width: input.rgba.width,
+        height: input.rgba.height,
+        source: input.source,
+        note: input.note,
+        createdAt: Date.now()
+    };
+    part.versions = [...versions, version];
+    part.activeTexture = version.v;
+    syncActiveTexture(part);
+    return version;
+}
+/** 把一批部件标成「贴图变了」：预览内联图片、图集要重打包，但装配位置不受影响。 */
+function invalidateTextures(job) {
+    invalidateFrom(job, "rig");
+}
+/** 解析「改哪些部件」：名字优先，其次按标签；两者都没给就是全部。 */
+function resolveTextureTargets(job, target) {
+    const ready = job.parts.filter((part) => part.status === "ready");
+    if (target.names !== undefined && target.names.length > 0) {
+        const missing = target.names.filter((name) => !ready.some((part) => part.name === name));
+        if (missing.length > 0)
+            throw new Error(`没有这些部件：${missing.join("、")}`);
+        return ready.filter((part) => target.names.includes(part.name));
+    }
+    if (target.tag !== undefined && target.tag !== "") {
+        const matched = ready.filter((part) => (part.tags ?? []).includes(target.tag));
+        if (matched.length === 0)
+            throw new Error(`没有带「${target.tag}」标签的部件`);
+        return matched;
+    }
+    return ready;
+}
+/**
+ * 换色（本地计算，免费）。
+ *
+ * 之所以**烤成一个新版本**而不是每次渲染时实时算：渲染发生在浏览器（预览）
+ * 与宿主（合成图/图集）两处，各自实现一遍着色只会让两边漂移；而且版本机制
+ * 天然给了「换个色不满意 → 回退」，不需要额外的撤销栈。
+ */
+export async function tintRigParts(jobId, target, tint, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const parts = resolveTextureTargets(job, target);
+    if (parts.length === 0)
+        throw new Error("没有可换色的部件");
+    const versions = {};
+    for (const part of parts) {
+        const active = activeVersionOf(part);
+        if (active === undefined)
+            continue;
+        const decoded = await decodeToRgba(rigAssetPath(jobId, active.file), 2048);
+        const tinted = tintRgba({ data: decoded.rgba, width: decoded.width, height: decoded.height }, tint);
+        const created = await addTextureVersion(jobId, part, { source: "tint", note: options.note, rgba: tinted });
+        versions[part.name] = created.v;
+    }
+    invalidateTextures(job);
+    appendJobLog(job.log, "info", `${options.by === "ai" ? "AI" : "手工"}换色：${parts.map((part) => part.name).join("、")}` +
+        (options.note === undefined ? "" : `（${options.note}）`));
+    await writeRigJob(job);
+    return { touched: parts.length, versions };
+}
+// ── AI 逐部件重绘（花钱，可选）──────────────────────────────────────────
+export const REDRAW_TASK_KEY = "redraw";
+/**
+ * 补边用的底色。
+ *
+ * **不能用白色**：部件常有浅色的（浅肤色手、白袜、白围裙），补成白底之后整张图
+ * 几乎是纯白，模型看不到主体，实测会直接交回一张空白图。
+ * 中灰对浅色与深色部件都有对比度，而且这一层底色在结果里会被 alpha 掩码切掉，
+ * 不会污染像素。
+ */
+const REDRAW_PAD_COLOR = [128, 128, 128];
+/** 结果的最低亮度标准差：低于它就认为「模型没画出内容」。 */
+const MIN_REDRAW_CONTRAST = 6;
+/** 一次重绘的提示词。
+ *
+ * 写法上踩过两个真实的坑，注释留在原处免得后人重踩：
+ *
+ *   ① **必须有具体主语**。实测提示词里最具体的一句是「flat clean background of a
+ *      single solid colour」，模型就老老实实交回一张纯色图——补边是白底就返回白、
+ *      换成灰底就返回灰。所以主语（「一只手」这类）由**语义层的角色**给出，
+ *      这比反复强调整体约束有用得多。
+ *   ② **不要叫模型去画背景**。背景在我们的流水线里会被 alpha 掩码切掉，
+ *      提它只会分散模型的注意力。
+ */
+export function buildRedrawPrompt(instruction, options = {}) {
+    const detail = instruction.trim() === "" ? "keep the original look, only clean it up" : instruction.trim();
+    const noun = ROLE_NOUNS[(options.role ?? "")] ?? "body part";
+    return [
+        `A single detached ${noun} of a 2D game character, shown alone on a plain background.`,
+        "",
+        `Repaint it as follows: ${detail}.`,
+        "",
+        "Requirements:",
+        `- draw the ${noun} clearly, filling roughly the same area and position as in the reference image;`,
+        "- keep the same silhouette and pose as the reference image;",
+        "- it is ONE body part only; never assemble a whole character;",
+        "- no text, no watermark, no background scenery.",
+        "",
+        "Negative: blank image, empty canvas, missing subject, full body, multiple connected parts."
+    ].join("\n");
+}
+/** 提示词摘要：写进版本的 `note`，回退时能看懂这一版是什么。 */
+function summarizePrompt(prompt) {
+    const flat = prompt.replace(/\s+/g, " ").trim();
+    return flat.length <= 28 ? flat : `${flat.slice(0, 28)}…`;
+}
+/**
+ * 用生图模型重绘**单个部件**（花钱：一次 Seedream 调用）。
+ *
+ * 与参考项目 reskin-app 的根本区别：它把**整张 atlas / 整张合成图**丢给模型，
+ * 回来必须再用 SAM / 连通域 / IoU 模板反向切回各个 slot。这里是**一个部件进、
+ * 一个部件出**——所以那一整套反向切分**完全不需要**。
+ *
+ * 三步保证「重绘后位置不乱」：
+ *   ① 先把部件补成**正方形**再送出去（模型会按自己的画幅习惯重排画面）；
+ *   ② 按同样的正方形裁回来、缩回原尺寸；
+ *   ③ 用原图的 **alpha 当掩码**——轮廓保持原样，模型画出来的背景被切掉。
+ * 轮廓不变是硬要求：装配框与骨骼锚点都绑在原来的轮廓上。
+ *
+ * 结果落成**新版本**（`source: "redraw"`），所以「这张不行」随时切回上一版。
+ */
+export async function redrawRigPart(jobId, name, prompt, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const part = job.parts.find((entry) => entry.name === name);
+    if (part === undefined)
+        throw new Error(`没有这个部件：${name}`);
+    const active = activeVersionOf(part);
+    if (active === undefined)
+        throw new Error(`「${name}」还没有贴图`);
+    const config = await loadConfig();
+    const blocker = imageProviderBlocker(config);
+    if (blocker !== undefined) {
+        throw new Error(`${blocker}，无法重绘（可以在界面里手工换色或上传替换，都不花钱）`);
+    }
+    const decoded = await decodeToRgba(rigAssetPath(jobId, active.file), 2048);
+    const original = { data: decoded.rgba, width: decoded.width, height: decoded.height };
+    const square = padToSquare(original, REDRAW_PAD_COLOR);
+    const dataUri = `data:image/png;base64,${encodePng(square.image.data, square.image.width, square.image.height).toString("base64")}`;
+    // 部件重绘单独指定模型的开关只在火山方舟下有意义；自定义后端只有一个模型名。
+    const redrawModel = imageRedrawModelOf(config);
+    /** 这一次真正会用的模型名（只用于报错文案）。 */
+    const modelUsedForRedraw = redrawModel;
+    const result = await generateImageWithProvider({
+        model: redrawModel,
+        prompt: buildRedrawPrompt(prompt, { role: part.role }),
+        images: [dataUri],
+        size: imageSizeOf(config),
+        watermark: imageWatermarkOf(config)
+    });
+    // 模型交回来的图要落盘才能解码（解码器是 ffmpeg，吃文件路径）。
+    const tempFile = join(rigJobDir(jobId), "parts", `.redraw-${Date.now()}.${result.ext}`);
+    await mkdir(join(rigJobDir(jobId), "parts"), { recursive: true });
+    let finished;
+    try {
+        await writeFile(tempFile, result.bytes);
+        const raw = await decodeToRgba(tempFile, 2048);
+        const masked = maskAndFit({ data: raw.rgba, width: raw.width, height: raw.height }, original, square, original.width, original.height);
+        // 边缘白晕是这类流程的普遍问题；按半径分档腐蚀最外圈。
+        finished = erodeAlpha(masked, Math.max(0, Math.round(options.erode ?? 1)));
+    }
+    finally {
+        await rm(tempFile, { force: true }).catch(() => undefined);
+    }
+    // **落盘前先判断「模型到底画出东西没有」。**
+    // 实测过：送进浅色部件 + 白底补边时，模型会直接交回一张纯白；照单全收的话
+    // 用户拿到的是一版白块贴图，而且从版本列表上看不出它坏了。
+    // 宁可这一次明确失败（日志与错误里说清原因），也不要留下坏数据。
+    const stats = imageStats(finished);
+    if (stats.opaque === 0) {
+        throw new Error("重绘结果在轮廓内没有任何不透明像素，已丢弃（没有新增版本）");
+    }
+    if (stats.stdDev < MIN_REDRAW_CONTRAST) {
+        throw new Error(`重绘结果几乎是纯色（亮度 ${stats.meanLuma.toFixed(0)}、标准差 ${stats.stdDev.toFixed(1)}），` +
+            `模型「${modelUsedForRedraw}」没有画出内容，已丢弃（没有新增版本）。` +
+            "可以换个更具体的提示词，或在「设置 → 游戏素材大师 → 生图后端」里换一个模型；" +
+            "只是想让颜色变一下的话，「换色」是免费的。");
+    }
+    // 重新读一次：生图可能耗时很久，期间任务可能已经被改过。
+    const fresh = await readRigJob(jobId);
+    if (fresh === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const node = fresh.parts.find((entry) => entry.name === name);
+    if (node === undefined)
+        throw new Error(`部件已被删除：${name}`);
+    const created = await addTextureVersion(jobId, node, {
+        source: "redraw",
+        note: options.note ?? summarizePrompt(prompt),
+        rgba: finished
+    });
+    invalidateTextures(fresh);
+    appendJobLog(fresh.log, "info", `已重绘「${name}」（v${created.v}，提示词：${summarizePrompt(prompt)}）`);
+    await writeRigJob(fresh);
+    return { name, version: created.v, width: created.width, height: created.height };
+}
+/** 后台执行重绘（生图要几十秒，不能阻塞 RPC）。 */
+export function startRigRedraw(jobId, name, prompt, options = {}) {
+    try {
+        assertIdle(jobId, REDRAW_TASK_KEY, "部件重绘");
+    }
+    catch (error) {
+        return { started: false, reason: messageOf(error) };
+    }
+    const started = kick(jobId, REDRAW_TASK_KEY, async () => {
+        await redrawRigPart(jobId, name, prompt, options);
+    });
+    return started ? { started: true } : { started: false, reason: "重绘已在进行中" };
+}
+/** 手工上传一张贴图顶掉当前版本（同样是**新增一版**，不覆盖）。 */ export async function uploadRigTexture(jobId, name, base64, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const part = job.parts.find((entry) => entry.name === name);
+    if (part === undefined)
+        throw new Error(`没有这个部件：${name}`);
+    const bytes = Buffer.from(base64, "base64");
+    const sniffed = sniffImage(base64);
+    if (sniffed === undefined)
+        throw new Error("不认识的图片格式（支持 PNG / JPEG / WebP）");
+    if (bytes.length > 30 * 1024 * 1024)
+        throw new Error("贴图超过 30 MB");
+    const tempFile = join(rigJobDir(jobId), "parts", `.incoming-${Date.now()}.${sniffed.ext}`);
+    await mkdir(join(rigJobDir(jobId), "parts"), { recursive: true });
+    await writeFile(tempFile, bytes);
+    try {
+        const decoded = await decodeToRgba(tempFile, 2048);
+        const created = await addTextureVersion(jobId, part, {
+            source: "upload",
+            note: options.note,
+            rgba: { data: decoded.rgba, width: decoded.width, height: decoded.height }
+        });
+        invalidateTextures(job);
+        appendJobLog(job.log, "info", `已上传「${name}」的新贴图（v${created.v}，${decoded.width}×${decoded.height}）`);
+        await writeRigJob(job);
+        return { name, version: created.v, width: created.width, height: created.height };
+    }
+    finally {
+        await rm(tempFile, { force: true }).catch(() => undefined);
+    }
+}
+/** 切到某一版（「这张 AI 头发不行，换回原版」）。 */
+export async function setRigTextureVersion(jobId, name, version) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const part = job.parts.find((entry) => entry.name === name);
+    if (part === undefined)
+        throw new Error(`没有这个部件：${name}`);
+    const versions = versionsOf(part);
+    const target = versions.find((item) => item.v === version);
+    if (target === undefined)
+        throw new Error(`「${name}」没有 v${version}（现有：${versions.map((item) => `v${item.v}`).join("、")}）`);
+    if (part.activeTexture === version)
+        return { version };
+    part.versions = versions;
+    part.activeTexture = version;
+    syncActiveTexture(part);
+    invalidateTextures(job);
+    appendJobLog(job.log, "info", `「${name}」已切到贴图 v${version}${target.note === undefined ? "" : `（${target.note}）`}`);
+    await writeRigJob(job);
+    return { version };
+}
+/** 删掉某一版（当前生效的那版不允许删；最后一版也不允许删）。 */
+export async function removeRigTextureVersion(jobId, name, version) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const part = job.parts.find((entry) => entry.name === name);
+    if (part === undefined)
+        throw new Error(`没有这个部件：${name}`);
+    const versions = versionsOf(part);
+    const target = versions.find((item) => item.v === version);
+    if (target === undefined)
+        throw new Error(`「${name}」没有 v${version}`);
+    if (versions.length <= 1)
+        throw new Error("这是最后一个版本，删掉部件就没有贴图了");
+    if ((part.activeTexture ?? versions[versions.length - 1].v) === version)
+        throw new Error("不能删除当前生效的版本，先切到别的版本");
+    part.versions = versions.filter((item) => item.v !== version);
+    await rm(rigAssetPath(jobId, target.file), { force: true }).catch(() => undefined);
+    syncActiveTexture(part);
+    invalidateTextures(job);
+    appendJobLog(job.log, "info", `已删除「${name}」的贴图 v${version}`);
+    await writeRigJob(job);
+    return { removed: 1 };
+}
+// ── 动画参数（M3：让动画从代码常量变成数据）─────────────────────────────
+/**
+ * 写入逐动画的可调参数。
+ *
+ * 只改骨骼与图集（动画变了、骨架没变），不动装配。
+ */
+export async function setRigAnimationSettings(jobId, patches, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const unknown = patches.filter((patch) => animationPresetOf(patch.id) === undefined);
+    if (unknown.length > 0)
+        throw new Error(`没有这个动画：${unknown.map((patch) => patch.id).join("、")}`);
+    if (patches.length === 0)
+        return { touched: 0, settings: job.animationSettings ?? {} };
+    const current = { ...(job.animationSettings ?? {}) };
+    let touched = 0;
+    for (const patch of patches) {
+        const merged = normalizeAnimationSettings({ [patch.id]: { ...(current[patch.id] ?? {}), ...patch } })?.[patch.id];
+        // 归一化后为空 = 这个动画的参数回到了默认值，条目直接删掉（与骨骼偏移同一套语义）。
+        if (merged === undefined)
+            delete current[patch.id];
+        else
+            current[patch.id] = merged;
+        touched++;
+    }
+    job.animationSettings = Object.keys(current).length === 0 ? undefined : current;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", `${options.by === "ai" ? "AI" : "手工"}调整动画参数：${patches.map((patch) => patch.id).join("、")}`);
+    await writeRigJob(job);
+    return { touched, settings: job.animationSettings ?? {} };
+}
+/** 清除动画参数（全部，或点名几个），回到预设的原始数值。 */
+export async function resetRigAnimationSettings(jobId, ids) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const current = { ...(job.animationSettings ?? {}) };
+    const targets = ids === undefined || ids.length === 0 ? Object.keys(current) : ids;
+    let touched = 0;
+    for (const id of targets) {
+        if (current[id] === undefined)
+            continue;
+        delete current[id];
+        touched++;
+    }
+    job.animationSettings = Object.keys(current).length === 0 ? undefined : current;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", touched > 0 ? `已重置 ${touched} 个动画的参数` : "没有需要重置的动画参数");
+    await writeRigJob(job);
+    return { touched };
+}
+// ── 关键帧编辑（阶段⑥：动画从「参数」变成「数据」）─────────────────────
+/** 一条时间轴最多多少关键帧——不是产品限制，是防止一份失控的数据把预览拖死。 */
+export const MAX_KEYFRAMES_PER_TRACK = 240;
+/** 一台动画最多多少条轨道。 */
+export const MAX_TRACKS_PER_ANIMATION = 96;
+/**
+ * 关键帧时间的对齐网格。
+ *
+ * 必须与导出用的帧率一致（`rigexport.ts` 的 `DRAGONBONES_FRAME_RATE`）：
+ * DragonBones 的 `duration` 以帧为单位，两帧落在同一帧上时中间那帧的 duration 为 0，
+ * 会被解析成阶跃并在导出校验里被拦下。对齐之后这种数据根本进不来。
+ */
+export const ANIMATION_FRAME_RATE = 30;
+/**
+ * 归一化一份手工动画。
+ *
+ * 校验尽量往前放：进去之后它就只是「一堆数字」，再想区分「用户打错了」和
+ * 「渲染器算错了」就很难了。这里丢掉的东西一定伴随一条 warning，
+ * 不做静默修正——静默修正是最伤人的那种「贴心」。
+ */
+function normalizeCustomAnimation(raw, fallback, issues) {
+    if (raw === null || typeof raw !== "object") {
+        issues.push("动画数据不是对象");
+        return undefined;
+    }
+    const input = raw;
+    const duration = Number.isFinite(input.duration) && input.duration > 0 ? Math.min(30, input.duration) : fallback.duration;
+    const loop = typeof input.loop === "boolean" ? input.loop : fallback.loop;
+    if (input.bones === null || typeof input.bones !== "object") {
+        issues.push("动画里没有 bones");
+        return undefined;
+    }
+    const bones = {};
+    let tracks = 0;
+    for (const [boneName, kindsRaw] of Object.entries(input.bones)) {
+        if (typeof boneName !== "string" || boneName === "")
+            continue;
+        if (kindsRaw === null || typeof kindsRaw !== "object")
+            continue;
+        const kinds = {};
+        for (const [kind, framesRaw] of Object.entries(kindsRaw)) {
+            if (kind !== "rotate" && kind !== "translate" && kind !== "scale")
+                continue;
+            if (!Array.isArray(framesRaw))
+                continue;
+            if (tracks >= MAX_TRACKS_PER_ANIMATION) {
+                issues.push(`轨道数超过上限 ${MAX_TRACKS_PER_ANIMATION}，多余的已忽略`);
+                break;
+            }
+            const valueKeys = keyframeValueKeys(kind);
+            const frames = [];
+            for (const frameRaw of framesRaw.slice(0, MAX_KEYFRAMES_PER_TRACK)) {
+                if (frameRaw === null || typeof frameRaw !== "object")
+                    continue;
+                const time = Number(frameRaw.time);
+                if (!Number.isFinite(time) || time < 0) {
+                    issues.push(`${boneName}/${kind} 有一个时间非法的关键帧，已丢弃`);
+                    continue;
+                }
+                const frame = { time: Number(Math.min(time, duration).toFixed(4)) };
+                for (const key of valueKeys) {
+                    const value = Number(frameRaw[key]);
+                    if (Number.isFinite(value))
+                        frame[key] = Number(value.toFixed(4));
+                }
+                if (valueKeys.some((key) => frame[key] === undefined)) {
+                    issues.push(`${boneName}/${kind} 有一个关键帧缺少 ${valueKeys.join("/")}，已丢弃`);
+                    continue;
+                }
+                // curve：null = 线性，`"stepped"` = 阶跃，4 个数 = 归一化控制点。
+                const curve = frameRaw.curve;
+                if (curve === "stepped")
+                    frame.curve = "stepped";
+                else if (Array.isArray(curve) && curve.length === 4 && curve.every((n) => Number.isFinite(Number(n)))) {
+                    frame.curve = curve.map((n) => Number(Number(n).toFixed(4)));
+                }
+                else if (curve === null || curve === undefined)
+                    frame.curve = null;
+                else {
+                    issues.push(`${boneName}/${kind} 有一个关键帧的 curve 不是 4 个数，已归为线性`);
+                    frame.curve = null;
+                }
+                frames.push(frame);
+            }
+            if (frames.length === 0)
+                continue;
+            // 时间必须严格递增：同一时刻两个帧在两条导出路径里的归属都是未定义的。
+            frames.sort((a, b) => a.time - b.time);
+            // **对齐到 30fps 的帧网格**，并丢掉会塌缩的相邻帧。
+            //
+            // 为什么必须对齐：DragonBones 的 `duration` 单位是帧，两帧相隔不足一帧时
+            // 它们会落在同一个 `frameStart` 上，中间那一帧的 `duration` 就是 0 ——
+            // 而 0 会被解析成**阶跃**，导出前校验也会直接拦下（实测：把一帧拖到
+            // 0.401s、它前面那帧在 0.4s，整条骨骼链路就这样失败了）。
+            // 在保存时对齐，坏数据根本进不了任务。
+            const dedup = [];
+            for (const frame of frames) {
+                const snapped = { ...frame, time: Number((Math.round(frame.time * ANIMATION_FRAME_RATE) / ANIMATION_FRAME_RATE).toFixed(4)) };
+                if (snapped.time > duration)
+                    continue;
+                if (dedup.length > 0 && snapped.time <= dedup[dedup.length - 1].time) {
+                    issues.push(`${boneName}/${kind} 有两个关键帧落在同一帧上（${snapped.time}s），已保留后一个`);
+                    dedup[dedup.length - 1] = snapped;
+                    continue;
+                }
+                dedup.push(snapped);
+            }
+            if (dedup.length === 0)
+                continue;
+            // 末帧永不携带 curve（它描述的是「以本帧为起点」的那一段，末帧没有下一段）。
+            dedup[dedup.length - 1].curve = null;
+            // 首帧必须是 0：否则 0 → 首帧之间是一段「没有定义的静默区」。
+            if (dedup[0].time > 1e-4) {
+                issues.push(`${boneName}/${kind} 的首帧不在 0 秒，已丢弃这段轨道`);
+                continue;
+            }
+            kinds[kind] = dedup;
+            tracks++;
+        }
+        if (Object.keys(kinds).length > 0)
+            bones[boneName] = kinds;
+    }
+    if (Object.keys(bones).length === 0) {
+        issues.push("没有任何可用的轨道");
+        return undefined;
+    }
+    return { duration, loop, bones, source: input.source === "ai" ? "ai" : "human", updatedAt: Date.now() };
+}
+/**
+ * 把一台动画变成**可编辑数据**，并（可选）整份写回。
+ *
+ * 不传 `animation` 就是「实例化」：用当前参数把预设烘成显式关键帧，之后以数据为准。
+ * 传了就是「整份替换」——界面上的每次拖动都提交一份完整的时间轴，
+ * 而不是一条 patch：时间轴的「增删改」三者互相牵连（删一帧会改两个段的归属），
+ * 服务端再去解析 patch 只会把同一套语义实现两遍。
+ */
+export async function saveRigAnimation(jobId, input) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const id = typeof input.id === "string" ? input.id : "";
+    const preset = animationPresetOf(id);
+    if (preset === undefined)
+        throw new Error(`没有这台动画：${id}`);
+    const names = input.boneNames !== undefined && input.boneNames.length > 0 ? input.boneNames : boneNamesOf(job);
+    const settings = job.animationSettings ?? {};
+    const base = instantiateAnimation(id, names, settings);
+    if (base === undefined)
+        throw new Error(`这台动画在当前部件集下没有任何轨道（预设依赖的骨骼都不存在）：${id}`);
+    const issues = [];
+    const source = input.animation === undefined ? undefined : input.animation;
+    const next = source === undefined
+        ? {
+            duration: base.duration,
+            loop: base.loop,
+            bones: base.bones,
+            source: "human",
+            updatedAt: Date.now()
+        }
+        : normalizeCustomAnimation(source, { duration: base.duration, loop: base.loop }, issues);
+    if (next === undefined) {
+        throw new Error(`动画数据不可用：${issues.slice(0, 3).join("；") || "解析失败"}`);
+    }
+    const animations = { ...(job.animations ?? {}) };
+    animations[id] = next;
+    job.animations = animations;
+    invalidateFrom(job, "rig");
+    let frames = 0;
+    let tracks = 0;
+    for (const kinds of Object.values(next.bones)) {
+        for (const list of Object.values(kinds)) {
+            tracks++;
+            frames += list.length;
+        }
+    }
+    appendJobLog(job.log, "info", `${source === undefined ? "开始编辑" : "已更新"}动画「${preset.label}」：${tracks} 条轨道 / ${frames} 个关键帧`);
+    for (const issue of issues.slice(0, 6))
+        appendJobLog(job.log, "warn", `动画「${preset.label}」：${issue}`);
+    await writeRigJob(job);
+    return { id, tracks, keyframes: frames, issues };
+}
+/**
+ * 取一台动画的**可编辑数据**，供时间轴编辑器渲染。
+ *
+ * 没编辑过时返回「预设实例化」的结果（同样是一份显式关键帧），界面因此可以
+ * 一视同仁地渲染，不需要「预设模式 / 编辑模式」两套代码。`custom` 告诉界面
+ * 这份数据是磁盘上的还是临时算的。
+ *
+ * 逐台取而不是塞进快照：一台动画几十条轨道、每条十几个关键帧，塞进每 2 秒
+ * 轮询一次的 `getRigJob` 里，为一个大多数人不会打开的编辑器付全量代价。
+ */
+export async function getRigAnimation(jobId, id) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const preset = animationPresetOf(id);
+    if (preset === undefined)
+        throw new Error(`没有这台动画：${id}`);
+    const custom = job.animations?.[id];
+    const names = boneNamesOf(job);
+    const draft = custom ?? instantiateAnimation(id, names, job.animationSettings ?? {});
+    if (draft === undefined)
+        throw new Error(`这台动画在当前部件集下没有任何轨道：${id}`);
+    // 骨骼顺序按骨架层级给，界面上的轨道列表才跟骨骼编辑器对得上。
+    const order = boneOrderOf(job);
+    const bones = {};
+    for (const name of order)
+        if (draft.bones[name] !== undefined)
+            bones[name] = draft.bones[name];
+    for (const [name, kinds] of Object.entries(draft.bones))
+        if (bones[name] === undefined)
+            bones[name] = kinds;
+    return {
+        id,
+        label: preset.label,
+        custom: custom !== undefined,
+        duration: draft.duration,
+        loop: draft.loop,
+        bones,
+        // 预设里没有轨道的骨骼（例如这台动作不动的部件）界面也要能「加一条轨道」。
+        boneOrder: names
+    };
+}
+/**
+ * 骨骼顺序：直接用**上一次推导出来的骨骼表**（它本来就是拓扑序），
+ * 没跑过骨骼、或之后新增了部件，才按部件顺序补齐。
+ *
+ * 不在这里重新推一遍父级：那正是 `spine.ts` 里刚修过的坑（父级在两处各算一次，
+ * 结果可以不同），界面上的轨道顺序没必要再冒一次险。
+ */
+function boneOrderOf(job) {
+    const names = boneNamesOf(job);
+    const known = new Set(names);
+    const seen = new Set();
+    const out = [];
+    for (const bone of job.rig.boneList ?? []) {
+        if (bone.name === "root" || !known.has(bone.name) || seen.has(bone.name))
+            continue;
+        seen.add(bone.name);
+        out.push(bone.name);
+    }
+    for (const name of names) {
+        if (seen.has(name))
+            continue;
+        seen.add(name);
+        out.push(name);
+    }
+    return out;
+}
+/** 丢掉手工数据，回到预设实例化（等于「还原这台动画」）。 */
+export async function resetRigAnimation(jobId, id) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const animations = { ...(job.animations ?? {}) };
+    if (animations[id] === undefined)
+        return { touched: 0 };
+    delete animations[id];
+    job.animations = Object.keys(animations).length === 0 ? undefined : animations;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", `已还原动画「${animationPresetOf(id)?.label ?? id}」到预设`);
+    await writeRigJob(job);
+    return { touched: 1 };
+}
+/** 当前参与骨架的部件名（= 骨骼名，root 除外）。 */
+function boneNamesOf(job) {
+    return job.parts.filter((part) => part.status === "ready" && part.hidden !== true).map((part) => part.name);
+}
+// ── IK 约束（M5）────────────────────────────────────────────────────────
+/**
+ * 写入 / 覆盖 IK 约束。
+ *
+ * 不传 `constraints` 的那条会被删掉；传了的整条替换。约束是**结构**（不是动画），
+ * 所以改动会作废骨骼与图集——骨架的求值链里多了一步求解。
+ */
+export async function setRigConstraints(jobId, patches, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const current = [...(job.constraints ?? [])];
+    let touched = 0;
+    for (const patch of patches) {
+        const index = current.findIndex((entry) => entry.name === patch.name);
+        if (patch.type === "none") {
+            if (index >= 0) {
+                current.splice(index, 1);
+                touched++;
+            }
+            continue;
+        }
+        const merged = {
+            type: "ik",
+            name: patch.name,
+            bone: patch.bone ?? (index >= 0 ? current[index].bone : ""),
+            target: patch.target ?? (index >= 0 ? current[index].target : `${patch.name}-target`),
+            chain: num(patch.chain, index >= 0 ? current[index].chain : 1),
+            bendPositive: patch.bendPositive ?? (index >= 0 ? current[index].bendPositive : true),
+            weight: Math.max(0, Math.min(1, num(patch.weight, index >= 0 ? current[index].weight : 1)))
+        };
+        if (merged.bone === "")
+            throw new Error(`IK「${merged.name}」缺少被约束的骨骼`);
+        if (merged.chain !== 1)
+            throw new Error(`IK「${merged.name}」目前只支持两根骨骼（chain = 1）`);
+        if (index >= 0)
+            current[index] = merged;
+        else
+            current.push(merged);
+        touched++;
+    }
+    job.constraints = current.length === 0 ? undefined : current;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", `${options.by === "ai" ? "AI" : "手工"}编辑 IK 约束：${patches.map((patch) => patch.name).join("、")}`);
+    await writeRigJob(job);
+    return { touched };
+}
+/** 清除 IK 约束（全部，或点名几条）。 */
+export async function resetRigConstraints(jobId, names) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const current = [...(job.constraints ?? [])];
+    const targets = names === undefined || names.length === 0 ? current.map((entry) => entry.name) : names;
+    const next = current.filter((entry) => !targets.includes(entry.name));
+    const touched = current.length - next.length;
+    job.constraints = next.length === 0 ? undefined : next;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", touched > 0 ? `已清除 ${touched} 条 IK 约束` : "没有需要清除的 IK 约束");
+    await writeRigJob(job);
+    return { touched };
+}
+// ── 蒙皮网格与 FFD 变形（M5 的 L1 / L3）──────────────────────────────────
+/**
+ * 给部件加/改网格与变形。
+ *
+ * `mesh: null` 表示取消这个部件的细分（回到整块贴图渲染）。`deform: null` 表示取消变形
+ * 但保留网格——两者分开是因为「细分了但暂时不加变形」是调试时的常见状态。
+ */
+export async function setRigMesh(jobId, patches, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const meshes = { ...(job.meshes ?? {}) };
+    const deforms = { ...(job.deforms ?? {}) };
+    const warnings = [];
+    let touched = 0;
+    for (const patch of patches) {
+        const part = job.parts.find((entry) => entry.name === patch.name && entry.status === "ready");
+        if (part === undefined) {
+            warnings.push(`没有这个可用部件：${patch.name}`);
+            continue;
+        }
+        if (patch.cols === null || patch.rows === null) {
+            delete meshes[patch.name];
+            delete deforms[patch.name];
+            touched++;
+            continue;
+        }
+        const current = meshes[patch.name] ?? { cols: MESH_DEFAULT_DIVISIONS, rows: MESH_DEFAULT_DIVISIONS };
+        const cols = Math.max(1, Math.min(MESH_MAX_DIVISIONS, Math.round(num(patch.cols, current.cols))));
+        const rows = Math.max(1, Math.min(MESH_MAX_DIVISIONS, Math.round(num(patch.rows, current.rows))));
+        meshes[patch.name] = { cols, rows };
+        touched++;
+        if (patch.deform === null) {
+            delete deforms[patch.name];
+            continue;
+        }
+        if (patch.deform === undefined)
+            continue;
+        const previous = deforms[patch.name];
+        const fallback = previous ?? {
+            mode: "wave",
+            // 默认幅度取部件短边的一个比例：裙子这么大一块，6% 大约是「一眼看得出来」的程度。
+            amplitude: Math.max(4, Math.round(Math.min(part.width, part.height) * 0.06)),
+            cycles: 1,
+            direction: 0,
+            anchor: "top",
+            duration: 1.6
+        };
+        deforms[patch.name] = {
+            mode: "wave",
+            amplitude: Math.max(0, Math.min(400, num(patch.deform.amplitude, fallback.amplitude))),
+            cycles: Math.max(0.25, Math.min(8, num(patch.deform.cycles, fallback.cycles))),
+            direction: num(patch.deform.direction, fallback.direction),
+            anchor: patch.deform.anchor === "bottom" || patch.deform.anchor === "none" ? patch.deform.anchor : fallback.anchor,
+            duration: Math.max(0.1, Math.min(10, num(patch.deform.duration, fallback.duration)))
+        };
+    }
+    job.meshes = Object.keys(meshes).length === 0 ? undefined : meshes;
+    job.deforms = Object.keys(deforms).length === 0 ? undefined : deforms;
+    // 网格会改变附件的**类型**（region → mesh），骨骼与图集都得重做。
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", `${options.by === "ai" ? "AI" : "手工"}编辑蒙皮：${patches.map((patch) => patch.name).join("、")}` +
+        (Object.keys(deforms).length > 0 ? `（带变形的 ${Object.keys(deforms).join("、")}）` : ""));
+    await writeRigJob(job);
+    return { touched, warnings };
+}
+// ── Path 约束（M5）──────────────────────────────────────────────────────
+/**
+ * 把路径点从**参考图像素**转成**骨骼世界坐标**（y 向上），供预览内联。
+ *
+ * 换算与 `buildSkeleton` 里的 `toWorld` 必须一致，所以直接读骨架自己写下来的
+ * `x/y/width/height`（那是导出时真正用的画布参数），而不是另取一份 settings。
+ */
+function previewPathsOf(job, spine) {
+    const out = {};
+    const entries = Object.entries(job.paths ?? {});
+    if (entries.length === 0)
+        return out;
+    // 画布尺寸只有骨架自己写下来的那份是准的——导出时用的就是它。
+    const width = num(spine?.skeleton?.width, 0);
+    const height = num(spine?.skeleton?.height, 0);
+    if (width <= 0 || height <= 0)
+        return out;
+    for (const [name, entry] of entries) {
+        const points = [];
+        for (let i = 0; i + 1 < entry.points.length; i += 2) {
+            points.push(Number((entry.points[i] - width / 2).toFixed(3)), Number((height - entry.points[i + 1]).toFixed(3)));
+        }
+        out[name] = {
+            points,
+            closed: entry.closed,
+            bones: entry.bones,
+            spacing: entry.spacing,
+            translateMix: entry.translateMix,
+            rotateMix: entry.rotateMix
+        };
+    }
+    return out;
+}
+/**
+ * 写入 / 覆盖一条路径约束。
+ *
+ * `bones` 不传时会用「沿路径最近的若干根骨」猜一条链——但那只是给个起点，
+ * 猜错了用户要能一眼看出来（面板里会把骨链列出来）。
+ */
+export async function setRigPath(jobId, patches, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const paths = { ...(job.paths ?? {}) };
+    const warnings = [];
+    let touched = 0;
+    const available = new Set(boneNamesOf(job));
+    for (const patch of patches) {
+        const previous = paths[patch.name];
+        const normalized = normalizePath(patch.points !== undefined ? { points: patch.points, closed: patch.closed } : previous ?? { points: [] });
+        if (normalized === undefined) {
+            warnings.push(`路径「${patch.name}」至少需要两个有效点`);
+            continue;
+        }
+        const chain = (patch.bones ?? previous?.bones ?? []).filter((name) => available.has(name));
+        if (chain.length === 0) {
+            warnings.push(`路径「${patch.name}」没有指定沿路径排列的骨骼`);
+            continue;
+        }
+        paths[patch.name] = {
+            points: normalized.points,
+            closed: normalized.closed,
+            bones: chain,
+            spacing: Math.max(0, num(patch.spacing, previous?.spacing ?? 0)),
+            translateMix: Math.max(0, Math.min(1, num(patch.translateMix, previous?.translateMix ?? 1))),
+            rotateMix: Math.max(0, Math.min(1, num(patch.rotateMix, previous?.rotateMix ?? 1)))
+        };
+        touched++;
+    }
+    job.paths = Object.keys(paths).length === 0 ? undefined : paths;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", `${options.by === "ai" ? "AI" : "手工"}编辑路径约束：${patches.map((patch) => patch.name).join("、")}`);
+    await writeRigJob(job);
+    return { touched, warnings };
+}
+/** 清除路径约束（全部，或点名几条）。 */
+export async function resetRigPath(jobId, names) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const paths = { ...(job.paths ?? {}) };
+    const targets = names === undefined || names.length === 0 ? Object.keys(paths) : names;
+    let touched = 0;
+    for (const name of targets) {
+        if (paths[name] === undefined)
+            continue;
+        delete paths[name];
+        touched++;
+    }
+    job.paths = Object.keys(paths).length === 0 ? undefined : paths;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", touched > 0 ? `已清除 ${touched} 条路径约束` : "没有需要清除的路径约束");
+    await writeRigJob(job);
+    return { touched };
+}
+/** 清除网格与变形（全部，或点名几个部件）。 */ export async function resetRigMesh(jobId, names) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const meshes = { ...(job.meshes ?? {}) };
+    const deforms = { ...(job.deforms ?? {}) };
+    const targets = names === undefined || names.length === 0 ? Object.keys(meshes) : names;
+    let touched = 0;
+    for (const name of targets) {
+        if (meshes[name] === undefined)
+            continue;
+        delete meshes[name];
+        delete deforms[name];
+        touched++;
+    }
+    job.meshes = Object.keys(meshes).length === 0 ? undefined : meshes;
+    job.deforms = Object.keys(deforms).length === 0 ? undefined : deforms;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", touched > 0 ? `已清除 ${touched} 个部件的网格与变形` : "没有需要清除的网格");
+    await writeRigJob(job);
+    return { touched };
+}
+export const EMPTY_BONE_OFFSET_TOLERANCE = 0.01;
+function roundOffset(value) {
+    return Number(value.toFixed(2));
+}
+/**
+ * 归一化一枚偏移：**去掉等于默认值的字段**。
+ *
+ * 这不是洁癖：`boneOffsets` 的语义是「人相对绑定姿势改了什么」，
+ * 全零的条目意味着「什么都没改」。把它留在文件里会让「改回去了没有」
+ * 变成一个需要比较数值才能回答的问题，也会让 JSON diff 噪音很大。
+ * 返回 `undefined` 表示这枚偏移是空的。
+ */
+export function pruneBoneOffset(value) {
+    const record = value !== null && typeof value === "object" ? value : {};
+    const out = {};
+    const x = num(record.x, 0);
+    const y = num(record.y, 0);
+    const rotation = num(record.rotation, 0);
+    if (Math.abs(x) > EMPTY_BONE_OFFSET_TOLERANCE)
+        out.x = roundOffset(x);
+    if (Math.abs(y) > EMPTY_BONE_OFFSET_TOLERANCE)
+        out.y = roundOffset(y);
+    if (Math.abs(rotation) > EMPTY_BONE_OFFSET_TOLERANCE)
+        out.rotation = roundOffset(rotation);
+    return Object.keys(out).length === 0 ? undefined : out;
+}
+function normalizeBoneOffsets(raw) {
+    if (raw === null || typeof raw !== "object")
+        return undefined;
+    const out = {};
+    for (const [name, value] of Object.entries(raw)) {
+        const item = pruneBoneOffset(value);
+        if (item !== undefined)
+            out[name] = item;
+    }
+    return Object.keys(out).length === 0 ? undefined : out;
+}
+/**
+ * 写入手工骨骼偏移（人在界面上拖/转骨骼，或 agent 给出建议）。
+ *
+ * 与 `setRigSemantics` 一样只作废**骨骼与图集**：偏移只影响骨骼推导，
+ * 部件摆在画布上的位置与它无关，作废到 layout 会让用户白丢一次手工摆位。
+ */
+export async function setRigBoneOffsets(jobId, patches, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (patches.length === 0)
+        return { touched: 0 };
+    const known = new Set(job.parts.map((part) => part.name));
+    for (const patch of patches) {
+        if (!known.has(patch.name))
+            throw new Error(`没有这个部件：${patch.name}`);
+    }
+    const current = { ...(job.boneOffsets ?? {}) };
+    let touched = 0;
+    for (const patch of patches) {
+        const merged = pruneBoneOffset({ ...(current[patch.name] ?? {}), ...patch });
+        if (merged === undefined)
+            delete current[patch.name];
+        else
+            current[patch.name] = merged;
+        touched++;
+    }
+    job.boneOffsets = Object.keys(current).length === 0 ? undefined : current;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", `${options.by === "ai" ? "AI" : "手工"}骨骼偏移：${patches.map((patch) => patch.name).join("、")}` +
+        (options.label === undefined ? "" : `（${options.label}）`));
+    await writeRigJob(job);
+    return { touched };
+}
+/** 清除手工骨骼偏移（全部，或点名几根）。这是「回到 AI 推的姿势」的唯一入口。 */
+export async function resetRigBoneOffsets(jobId, names) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const current = { ...(job.boneOffsets ?? {}) };
+    const targets = names === undefined || names.length === 0 ? Object.keys(current) : names;
+    let touched = 0;
+    for (const name of targets) {
+        if (current[name] === undefined)
+            continue;
+        delete current[name];
+        touched++;
+    }
+    job.boneOffsets = Object.keys(current).length === 0 ? undefined : current;
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", touched > 0 ? `已清除 ${touched} 根骨骼的手工偏移` : "没有需要清除的手工偏移");
+    await writeRigJob(job);
+    return { touched };
+}
+// ── 语义层（阶段③）──────────────────────────────────────────────────────
+/** 参与语义的部件：只有 ready 且没被隐藏的部件才进骨架。 */
+function semanticPartsOf(job) {
+    return job.parts.filter((part) => part.status === "ready" && part.hidden !== true);
+}
+/** 把一个部件节点摊成语义层的输入形状。 */
+function semanticsInputOf(parts) {
+    return parts.map((part) => ({
+        name: part.name,
+        role: part.role,
+        parent: part.parent,
+        proximal: part.proximal,
+        distal: part.distal,
+        tags: part.tags,
+        source: part.semanticsSource
+    }));
+}
+/**
+ * 补齐缺失的语义。
+ *
+ * **这是「不填表也能跑」的落点**：拆件刚跑完、或用户刚上传完部件时，每个部件
+ * 都还没有语义；这里用 `defaultSemanticsOf` 一次性补全（角色按名字推断、父级按
+ * 角色链推导、锚点取角色默认）。之后 AI 或人只需要改**不对的那几条**。
+ *
+ * 返回补齐的条数，便于在日志里说清楚「这一步做了什么」。
+ */
+export function ensurePartSemantics(job) {
+    const parts = semanticPartsOf(job);
+    if (parts.length === 0)
+        return 0;
+    const fresh = defaultSemanticsOf(parts.map((part) => part.name));
+    const byName = new Map(fresh.map((item) => [item.name, item]));
+    let filled = 0;
+    for (const part of parts) {
+        if (part.role !== undefined && part.proximal !== undefined && part.distal !== undefined)
+            continue;
+        const item = byName.get(part.name);
+        if (item === undefined)
+            continue;
+        if (part.role === undefined)
+            part.role = item.role;
+        if (part.parent === undefined)
+            part.parent = item.parent;
+        if (part.proximal === undefined)
+            part.proximal = item.proximal;
+        if (part.distal === undefined)
+            part.distal = item.distal;
+        if (part.tags === undefined)
+            part.tags = item.tags;
+        if (part.semanticsSource === undefined)
+            part.semanticsSource = "default";
+        filled++;
+    }
+    // 顺手做一次**修复**：删部件 / 隐藏部件 / 改名字之后，父级可能指向已经不存在的
+    // 部件。悬空父级会让骨架断链，成环会让渲染无限递归——两者都必须在写入前清掉。
+    // 放在这里而不是每个调用点，是因为「改变部件集合」的入口有好几个（分割、上传、
+    // 删除、隐藏、改名），漏掉任何一个都会留下坏数据。
+    const repaired = validateSemantics(semanticsInputOf(semanticPartsOf(job)));
+    writeSemantics(job, repaired.parts);
+    return filled;
+}
+/**
+ * 校验当前任务的语义。
+ *
+ * 失败也返回可用的 `parts`（语义层的校验函数保证这一点），所以界面永远能显示
+ * 「哪里不对」，而不是一片空白。
+ */
+export function validateRigSemantics(job, options = {}) {
+    const parts = semanticPartsOf(job);
+    const result = validateSemantics(semanticsInputOf(parts), options);
+    return { parts: result.parts, errors: result.errors, warnings: result.warnings, ok: result.ok };
+}
+/** 把校验后的语义写回部件节点。 */
+function writeSemantics(job, parts) {
+    const byName = new Map(parts.map((part) => [part.name, part]));
+    for (const node of job.parts) {
+        const item = byName.get(node.name);
+        if (item === undefined)
+            continue;
+        node.role = item.role;
+        node.parent = item.parent;
+        node.proximal = item.proximal;
+        node.distal = item.distal;
+        node.tags = item.tags;
+        node.semanticsSource = item.source;
+    }
+}
+/**
+ * 局部修改语义（AI 或人）。
+ *
+ * 只改传进来的字段——这是细粒度失效传播的前提：改一个部件的 `parent` 不应该
+ * 让整份语义表重新生成，也不应该丢掉别人调过的锚点。
+ *
+ * 校验不通过时**不落盘**：错误会原样返回给调用方（界面/agent），
+ * 由它决定是修正还是强制写入。理由是语义错误会一路传到骨架与导出，
+ * 静默写进去比直接拒绝代价大得多。
+ */
+export async function setRigSemantics(jobId, patches, options = {}) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (patches.length === 0)
+        return { ok: true, touched: 0, errors: [], warnings: [] };
+    const known = new Set(job.parts.map((part) => part.name));
+    for (const patch of patches) {
+        if (!known.has(patch.name))
+            throw new Error(`没有这个部件：${patch.name}`);
+    }
+    ensurePartSemantics(job);
+    const by = options.by ?? "human";
+    const merged = mergeSemantics(semanticsInputOf(semanticPartsOf(job)), patches).map((item) => {
+        const touched = patches.some((patch) => patch.name === item.name);
+        return touched ? { ...item, source: by } : item;
+    });
+    const validated = validateSemantics(merged, { humanoid: options.humanoid });
+    if (!validated.ok) {
+        return { ok: false, touched: 0, errors: validated.errors, warnings: validated.warnings };
+    }
+    writeSemantics(job, validated.parts);
+    // ⚠️ 只作废「骨骼与图集」，**不动装配结果**：语义（角色/父级/锚点）只影响
+    // 骨骼推导，而部件摆在画布上的位置与语义无关。作废到 layout 会让用户改一次
+    // 角色就白丢一次手工摆位——而角色恰恰是最需要反复试的字段。
+    invalidateFrom(job, "rig");
+    appendJobLog(job.log, "info", `语义已更新：${patches.map((patch) => patch.name).join("、")}` +
+        (validated.warnings.length > 0 ? `；${validated.warnings.length} 条提示` : ""));
+    await writeRigJob(job);
+    return { ok: true, touched: patches.length, errors: [], warnings: validated.warnings };
+}
+// ── 阶段①：拆件 ────────────────────────────────────────────────────────
+/**
+ * 用生图模型生成「拆件摊平图」。**这一步是唯一花钱的阶段**：一次 Seedream 调用。
+ */
+export function startSheetGeneration(jobId) {
+    try {
+        assertIdle(jobId, "sheet", "拆件生图");
+    }
+    catch (error) {
+        return { started: false, reason: messageOf(error) };
+    }
+    const started = kick(jobId, "sheet", () => generateSheet(jobId));
+    return started ? { started: true } : { started: false, reason: "拆件生图已在进行中" };
+}
+export async function generateSheet(jobId) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const config = await loadConfig();
+    assertImageProviderReady(config);
+    if (job.source === undefined)
+        throw new Error("还没有角色参考图，请先上传一张整图");
+    const prompt = buildSheetRequest(job);
+    const model = imageModelOf(config);
+    job.settings.model = model;
+    if (imageUsesConfiguredSize(config))
+        job.settings.size = imageSizeOf(config);
+    job.sheet = { ...job.sheet, status: "running", error: undefined };
+    appendJobLog(job.log, "info", `开始拆件生图（模型 ${model}）`);
+    await writeRigJob(job);
+    try {
+        const reference = await toDataUri(rigAssetPath(jobId, job.source.file), mimeOf(job.source.file));
+        const result = await generateImageWithProvider({
+            prompt,
+            images: [reference],
+            size: job.settings.size || imageSizeOf(config),
+            // 与图片生成那条路同口径：全局设置或任务上的旧覆盖位，任一为真就带水印。
+            watermark: imageWatermarkOf(config) || job.settings.watermark === true,
+            timeoutMs: imageTimeoutOf(config)
+        });
+        const relative = `sheet/parts-sheet.${result.ext}`;
+        await mkdir(join(rigJobDir(jobId), "sheet"), { recursive: true });
+        await writeFile(rigAssetPath(jobId, relative), result.bytes);
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        fresh.sheet = { status: "ready", file: relative, error: undefined, updatedAt: Date.now() };
+        appendJobLog(fresh.log, "info", `拆件图已生成（${(result.bytes.length / 1024).toFixed(0)} KB）`);
+        await writeRigJob(fresh);
+    }
+    catch (error) {
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        fresh.sheet = { ...fresh.sheet, status: "error", error: messageOf(error), updatedAt: Date.now() };
+        appendJobLog(fresh.log, "error", `拆件生图失败：${messageOf(error)}`);
+        await writeRigJob(fresh);
+        throw error;
+    }
+    // 生图成功后立刻分割，用户拿到的是一个可以直接验收的部件列表。
+    await segmentSheet(jobId);
+}
+export function startSegmentation(jobId) {
+    try {
+        assertIdle(jobId, "segment", "分割");
+    }
+    catch (error) {
+        return { started: false, reason: messageOf(error) };
+    }
+    const started = kick(jobId, "segment", () => segmentSheet(jobId));
+    return started ? { started: true } : { started: false, reason: "分割已在进行中" };
+}
+/**
+ * 把摊平图切成部件。
+ *
+ * 分割依赖「格子 = 部件身份」这个约定：连通域按质心归到某个格子，格子名就是
+ * 部件名。一个格子里出现多块时取最大的一块，其余作为 `名字-2` 之类的附加件保留
+ * ——生图模型偶尔会把配饰画成独立小块，直接丢掉不如留给用户判断。
+ */
+export async function segmentSheet(jobId) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (job.sheet.file === undefined)
+        throw new Error("还没有拆件图，请先在第 ① 步生成或上传");
+    const decoded = await decodeToRgba(rigAssetPath(jobId, job.sheet.file), 2048);
+    const atlas = { data: decoded.rgba, width: decoded.width, height: decoded.height };
+    const background = detectBackground(atlas);
+    const columns = job.settings.gridColumns;
+    const rows = job.settings.gridRows;
+    const cellWidth = atlas.width / columns;
+    const cellHeight = atlas.height / rows;
+    const autoMinArea = Math.max(120, Math.round((atlas.width * atlas.height) / (columns * rows) * 0.004));
+    const minArea = job.settings.minArea > 0 ? job.settings.minArea : autoMinArea;
+    const segmented = segmentWithLabels(atlas, {
+        background,
+        tolerance: job.settings.backgroundTolerance,
+        minArea,
+        padding: job.settings.partPadding,
+        feather: job.settings.feather
+    });
+    const components = segmented.components;
+    appendJobLog(job.log, "info", `分割：底色 rgb(${background.join(",")})，连通域 ${components.length} 块（最小面积 ${minArea}）`);
+    await mkdir(join(rigJobDir(jobId), "parts"), { recursive: true });
+    // 先把「挨在一起的碎块」并成一个部件，再按格子命名。两步都不能省：
+    //
+    // ① **按包围盒邻近合并**，而不是「一格合并所有」。实测生图模型会把一件东西画成
+    //    互不相连的几块（围裙的白布片、鲸鱼刺绣、裙摆高光都是独立连通域），按格子
+    //    一把抓会把它们和同格的**别的**部件揉在一起——实测出现过「一只手 + 两段袖子」
+    //    被并成一个部件，那种部件根本没法摆。
+    // ② 命名另算（见 cellOfGroup）：溢出多半是往下的（裙摆、头发、尾巴），按面积最大
+    //    归属会把整条裙子判给下面那格，于是它被命名成 right-lower-arm。
+    // 合并阈值取「格子的 1.5%」，实测 4~8px：同一件东西被画成几块时（围裙的白布片、
+    // 鲸鱼刺绣）它们真的挨得很近，而不同部件之间模型会留出明显空白。
+    const MERGE_GAP = Math.max(3, Math.round(Math.min(cellWidth, cellHeight) * 0.015));
+    const rootOf = groupComponentsByProximity(segmented.labels, segmented.width, segmented.height, MERGE_GAP);
+    const groups = new Map();
+    for (let i = 0; i < components.length; i++) {
+        const root = rootOf[components[i].label];
+        const list = groups.get(root) ?? [];
+        list.push(i);
+        groups.set(root, list);
+    }
+    /** 一组连通域的并集包围盒。 */
+    const groupBox = (indices) => {
+        let x0 = Number.POSITIVE_INFINITY;
+        let y0 = Number.POSITIVE_INFINITY;
+        let x1 = 0;
+        let y1 = 0;
+        for (const item of indices) {
+            const component = components[item];
+            x0 = Math.min(x0, component.x);
+            y0 = Math.min(y0, component.y);
+            x1 = Math.max(x1, component.x + component.width);
+            y1 = Math.max(y1, component.y + component.height);
+        }
+        return { x: x0, y: y0, width: x1 - x0, height: y1 - y0 };
+    };
+    const overlapWithCell = (box, cell) => {
+        const column = cell % columns;
+        const row = Math.floor(cell / columns);
+        const overlapX = Math.max(0, Math.min(box.x + box.width, (column + 1) * cellWidth) - Math.max(box.x, column * cellWidth));
+        const overlapY = Math.max(0, Math.min(box.y + box.height, (row + 1) * cellHeight) - Math.max(box.y, row * cellHeight));
+        return overlapX * overlapY;
+    };
+    /**
+     * 组 → 格子：在覆盖率不低于最大值一半的候选里，取**最靠上**（再最靠左）的那格。
+     * 部件溢出多半往下（裙摆、头发、尾巴），取最上那格正好对上模型的意图：
+     * 实测整条裙子若按面积最大归属会被判给下面那格，命名成 right-lower-arm。
+     */
+    const cellOfGroup = (box) => {
+        const cells = [...Array(columns * rows).keys()].map((cell) => ({ cell, overlap: overlapWithCell(box, cell) }));
+        const best = Math.max(...cells.map((item) => item.overlap));
+        return cells
+            .filter((item) => item.overlap >= best * 0.5)
+            .sort((left, right) => Math.floor(left.cell / columns) - Math.floor(right.cell / columns) ||
+            (left.cell % columns) - (right.cell % columns))[0].cell;
+    };
+    // 面积大的先占格子，避免小碎块把格子抢走。
+    const orderedGroups = [...groups.values()].sort((left, right) => right.reduce((sum, item) => sum + components[item].area, 0) - left.reduce((sum, item) => sum + components[item].area, 0));
+    const slotNames = rigSlotNames(job);
+    /** 手工上传的部件不受网格分割影响，保留下来。 */
+    const uploaded = job.parts.filter((part) => part.source === "uploaded" && part.status === "ready");
+    const next = [...uploaded];
+    const claimed = new Set(uploaded.map((part) => part.name));
+    const takenCells = new Set();
+    /** 质检要用的像素：分割出来的部件图本来就在内存里，顺手留一份，不必再解一遍盘。 */
+    const qaParts = [];
+    let mergedFragments = 0;
+    let order = 0;
+    for (const group of orderedGroups) {
+        order++;
+        const box = groupBox(group);
+        let cell = cellOfGroup(box);
+        if (takenCells.has(cell)) {
+            const free = [...Array(columns * rows).keys()]
+                .filter((candidate) => !takenCells.has(candidate))
+                .sort((left, right) => overlapWithCell(box, right) - overlapWithCell(box, left) || left - right);
+            cell = free[0] ?? cell;
+        }
+        const slot = slotNames[cell] ?? `slot-${cell + 1}`;
+        const name = claimed.has(slot) ? `${slot}-${order}` : slot;
+        claimed.add(name);
+        takenCells.add(cell);
+        const merged = mergeComponents(group.map((item) => components[item]), atlas.width, atlas.height);
+        const trimmed = trimTransparent(merged);
+        qaParts.push({ name, rgba: trimmed });
+        const relative = `parts/${name}.png`;
+        await writeFile(rigAssetPath(jobId, relative), encodePng(trimmed.data, trimmed.width, trimmed.height));
+        let opaque = 0;
+        for (let k = 0; k < trimmed.width * trimmed.height; k++)
+            if (trimmed.data[k * 4 + 3] > 128)
+                opaque++;
+        if (group.length > 1)
+            mergedFragments += group.length - 1;
+        next.push({
+            name,
+            label: partLabel(name),
+            status: "ready",
+            file: relative,
+            width: trimmed.width,
+            height: trimmed.height,
+            gridX: cell % columns,
+            gridY: Math.floor(cell / columns),
+            opacity: Number((opaque / (trimmed.width * trimmed.height)).toFixed(3)),
+            source: "generated",
+            approved: false,
+            updatedAt: Date.now()
+        });
+    }
+    // 删掉旧的 slotNames/uploaded/claimed 声明（现在在上面）
+    const fresh = await readRigJob(jobId);
+    if (fresh === undefined)
+        return;
+    fresh.parts = next;
+    // 分割完立刻补齐语义：这样「格子名 → 角色 → 父级/锚点」是一条确定链路，
+    // 用户可以先去装配、也可以先改语义，两条路都不需要先填一张表。
+    const filledSemantics = ensurePartSemantics(fresh);
+    fresh.layout = { status: "empty", items: {} };
+    fresh.rig = { status: "empty" };
+    fresh.atlas = { status: "empty" };
+    // 生成部件蒙太奇：把分割出来的部件按**与 parts 数组相同的顺序**拼成一张图。
+    // 这是「视觉先验」那一步的输入——多模态模型看一张图比逐个打开十几个文件省事得多，
+    // 而且顺序固定，它说「第 7 格是左手」我们就能直接换算成部件名。
+    const generated = next.filter((part) => part.source === "generated" && part.file !== undefined);
+    if (generated.length > 0) {
+        const CELL = 200;
+        const COLS = Math.min(6, generated.length);
+        const ROWS = Math.ceil(generated.length / COLS);
+        const canvas = createRgba(CELL * COLS, CELL * ROWS, [246, 246, 249, 255]);
+        for (let i = 0; i < generated.length; i++) {
+            const decoded = await decodeCached(rigAssetPath(jobId, generated[i].file), 1024);
+            const scale = Math.min((CELL - 14) / decoded.width, (CELL - 14) / decoded.height);
+            const scaled = resizeRgba({ data: decoded.rgba, width: decoded.width, height: decoded.height }, Math.max(1, Math.round(decoded.width * scale)), Math.max(1, Math.round(decoded.height * scale)));
+            const column = i % COLS;
+            const row = Math.floor(i / COLS);
+            blitRgba(canvas, scaled, column * CELL + Math.round((CELL - scaled.width) / 2), row * CELL + Math.round((CELL - scaled.height) / 2));
+            // 画格线，让「第几格」在图上可以直接数出来。
+            for (let x = column * CELL; x < column * CELL + CELL && x < canvas.width; x++) {
+                const at = (row * CELL) * canvas.width * 4 + x * 4;
+                canvas.data[at] = 208;
+                canvas.data[at + 1] = 208;
+                canvas.data[at + 2] = 216;
+            }
+            for (let y = row * CELL; y < row * CELL + CELL && y < canvas.height; y++) {
+                const at = (y * canvas.width + column * CELL) * 4;
+                canvas.data[at] = 208;
+                canvas.data[at + 1] = 208;
+                canvas.data[at + 2] = 216;
+            }
+        }
+        await mkdir(join(rigJobDir(jobId), "sheet"), { recursive: true });
+        await writeFile(rigAssetPath(jobId, "sheet/parts-montage.png"), encodePng(canvas.data, canvas.width, canvas.height));
+        await writeFile(rigAssetPath(jobId, "sheet/parts.json"), `${JSON.stringify({ columns: COLS, cell: CELL, order: generated.map((part) => part.name) }, null, 2)}\n`, "utf8");
+    }
+    const missing = slotNames.filter((name) => !next.some((part) => part.name === name));
+    appendJobLog(fresh.log, "info", `分割完成：${next.filter((p) => p.source === "generated").length} 个部件` +
+        (missing.length > 0 ? `；这些格子没有检测到部件：${missing.join("、")}` : "") +
+        (mergedFragments > 0 ? `；有 ${mergedFragments} 个碎块被并进了相邻的部件` : "") +
+        (filledSemantics > 0 ? `；已补齐 ${filledSemantics} 个部件的语义（角色/父级/锚点）` : ""));
+    // 生图模型不按网格摆的情况并不罕见（实测常把「上臂+小臂+手」连成一整块，
+    // 或者把角色摊成两三行松散布局）。这时格子归属就没有意义了，与其让骨架
+    // 挂着一堆错名字，不如明确告诉用户：重新生成，或者手工上传命名部件。
+    if (missing.length >= Math.ceil(slotNames.length * 0.4)) {
+        appendJobLog(fresh.log, "warn", `拆件图有 ${missing.length}/${slotNames.length} 个格子是空的——生图模型很可能没有按网格摆放。` +
+            `建议：① 重新生成拆件图；② 或者用「部件 PNG」上传框自己传（文件名即部件名，如 head.png、torso.png）。` +
+            `空着的部件会被跳过，不会进入骨架。`);
+    }
+    // 拆件质检：**在装配之前**就把「这批拆件能不能信」说出来。
+    //
+    // 这一步专门为这次踩的坑而加：18 块里 6 块是同一部位重画、名字与实际内容错位，
+    // 而界面当时显示的是"部件（18）——逐件验收"，一切正常。要等到装配完、
+    // 看见"头长在脚上"才发现，那时已经花掉了一次生图调用和一轮手工排查。
+    fresh.qa = buildQaState(assessParts({
+        parts: qaParts,
+        expectedParts: fresh.qa?.expectedParts
+    }));
+    appendJobLog(fresh.log, fresh.qa.ok ? "info" : "warn", `拆件质检：${fresh.qa.summary}`);
+    for (const issue of fresh.qa.issues) {
+        appendJobLog(fresh.log, issue.level === "error" ? "warn" : "info", `拆件质检 · ${issue.message}`);
+    }
+    await writeRigJob(fresh);
+}
+/** 把质检报告压成任务里存的那份（去掉只在计算时有意义的字段）。 */
+function buildQaState(report, expectedParts) {
+    return {
+        ok: report.ok,
+        score: report.score,
+        summary: report.summary,
+        checked: report.checked,
+        duplicates: report.duplicates.map((group) => ({
+            parts: group.parts,
+            minOverlap: group.minOverlap,
+            mirroredOverlap: group.mirroredOverlap,
+            symmetric: group.symmetric
+        })),
+        issues: report.issues.map((issue) => ({
+            level: issue.level,
+            code: issue.code,
+            parts: issue.parts,
+            message: issue.message,
+            suggestion: issue.suggestion
+        })),
+        // `expectedParts` 是人/agent 给的输入，不随重算丢失——否则装配重跑一次它就没了。
+        ...(expectedParts === undefined ? {} : { expectedParts }),
+        updatedAt: Date.now()
+    };
+}
+/**
+ * 重跑拆件质检（从磁盘读部件像素）。
+ *
+ * `expectedParts`（参考图里大致有几个独立部位）只能靠视觉判断，所以留成参数：
+ * agent 看图后填，用户也可以自己填。给不出就不做这项判断——
+ * 宁可不报，也不要瞎报。
+ */
+export async function runRigQa(jobId, expectedParts) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const parts = [];
+    for (const part of job.parts) {
+        if (part.status !== "ready" || part.file === undefined)
+            continue;
+        if (part.hidden === true)
+            continue;
+        try {
+            const decoded = await decodeCached(rigAssetPath(jobId, part.file), 1024);
+            parts.push({ name: part.name, rgba: { data: decoded.rgba, width: decoded.width, height: decoded.height } });
+        }
+        catch {
+            // 读不出来的部件不参与质检——它是另一个问题（文件坏了），不该在这里报。
+        }
+    }
+    const matches = job.layout.items === undefined
+        ? []
+        : Object.entries(job.layout.items)
+            // 人给过位置的部件不参与「匹配质量」评估：那个分数要么已经被清掉，
+            // 要么描述的是它被挪走**之前**的自动结果。
+            .filter(([, item]) => item.manual !== true)
+            .map(([name, item]) => ({ name, score: item.score, matched: item.matched }));
+    const report = assessParts({
+        parts,
+        matches,
+        expectedParts: expectedParts ?? job.qa?.expectedParts
+    });
+    job.qa = buildQaState(report);
+    if (expectedParts !== undefined)
+        job.qa.expectedParts = expectedParts;
+    appendJobLog(job.log, report.ok ? "info" : "warn", `拆件质检：${report.summary}`);
+    await writeRigJob(job);
+    return job.qa;
+}
+/**
+ * 把同一格里的多个连通域合并成一张部件图（各块保留自己的透明通道，按位置贴回去）。
+ */
+function mergeComponents(list, canvasWidth, canvasHeight) {
+    let minX = canvasWidth;
+    let minY = canvasHeight;
+    let maxX = 0;
+    let maxY = 0;
+    for (const item of list) {
+        minX = Math.min(minX, item.x);
+        minY = Math.min(minY, item.y);
+        maxX = Math.max(maxX, item.x + item.width);
+        maxY = Math.max(maxY, item.y + item.height);
+    }
+    const width = Math.max(1, maxX - minX);
+    const height = Math.max(1, maxY - minY);
+    const out = createRgba(width, height);
+    for (const item of list) {
+        for (let y = 0; y < item.rgba.height; y++) {
+            const ty = item.y - minY + y;
+            if (ty < 0 || ty >= height)
+                continue;
+            for (let x = 0; x < item.rgba.width; x++) {
+                const tx = item.x - minX + x;
+                if (tx < 0 || tx >= width)
+                    continue;
+                const src = (y * item.rgba.width + x) * 4;
+                if (item.rgba.data[src + 3] === 0)
+                    continue;
+                const dst = (ty * width + tx) * 4;
+                out.data[dst] = item.rgba.data[src];
+                out.data[dst + 1] = item.rgba.data[src + 1];
+                out.data[dst + 2] = item.rgba.data[src + 2];
+                out.data[dst + 3] = Math.max(out.data[dst + 3], item.rgba.data[src + 3]);
+            }
+        }
+    }
+    return out;
+}
+/** 去掉四周全透明边，让部件坐标都从自己的左上角量起。 */
+function trimTransparent(rgba) {
+    let minX = rgba.width;
+    let minY = rgba.height;
+    let maxX = -1;
+    let maxY = -1;
+    for (let y = 0; y < rgba.height; y++) {
+        for (let x = 0; x < rgba.width; x++) {
+            if (rgba.data[(y * rgba.width + x) * 4 + 3] <= 8)
+                continue;
+            if (x < minX)
+                minX = x;
+            if (y < minY)
+                minY = y;
+            if (x > maxX)
+                maxX = x;
+            if (y > maxY)
+                maxY = y;
+        }
+    }
+    if (maxX < 0)
+        return rgba;
+    const width = maxX - minX + 1;
+    const height = maxY - minY + 1;
+    const out = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y++) {
+        rgba.data.copy(out, y * width * 4, ((minY + y) * rgba.width + minX) * 4, ((minY + y) * rgba.width + minX + width) * 4);
+    }
+    return { data: out, width, height };
+}
+// ── 阶段②：装配定位 ────────────────────────────────────────────────────
+export function startLayout(jobId, names) {
+    try {
+        assertIdle(jobId, "layout", "装配定位");
+    }
+    catch (error) {
+        return { started: false, reason: messageOf(error) };
+    }
+    const started = kick(jobId, "layout", () => solveRigLayout(jobId, names));
+    return started ? { started: true } : { started: false, reason: "装配定位已在进行中" };
+}
+/**
+ * 把部件摆回参考姿态。
+ *
+ * `names` 为空时求解全部（并做冲突消解与遮挡修正）；只给部分名字时**只重跑这些
+ * 部件**，保留其余结果——失败一两个部件时用户只需要重试那几个，不必整批重算。
+ */
+export async function solveRigLayout(jobId, names) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (job.source === undefined)
+        throw new Error("还没有角色参考图，请先上传一张整图");
+    const ready = job.parts.filter((part) => part.status === "ready" && part.hidden !== true && part.file !== undefined);
+    if (ready.length === 0)
+        throw new Error("还没有可用部件，请先在第 ① 步拆件或上传部件 PNG");
+    const subset = names === undefined || names.length === 0 ? undefined : ready.filter((part) => names.includes(part.name));
+    if (subset !== undefined && subset.length === 0)
+        throw new Error("指定的部件都不存在或还不可用");
+    const referenceDecoded = await decodeToRgba(rigAssetPath(jobId, job.source.file), 2048);
+    const reference = { data: referenceDecoded.rgba, width: referenceDecoded.width, height: referenceDecoded.height };
+    const inputs = [];
+    for (const part of subset ?? ready) {
+        const decoded = await decodeCached(rigAssetPath(jobId, part.file), 2048);
+        inputs.push({ name: part.name, rgba: { data: decoded.rgba, width: decoded.width, height: decoded.height } });
+        part.width = decoded.width;
+        part.height = decoded.height;
+    }
+    job.layout.status = "running";
+    job.layout.error = undefined;
+    appendJobLog(job.log, "info", `开始装配定位：${inputs.length} 个部件${subset === undefined ? "（全量）" : "（部分重跑）"}`);
+    await writeRigJob(job);
+    try {
+        const solved = await solveLayoutAsync(reference, inputs, {
+            longEdge: job.settings.matchLongEdge,
+            drawOrder: subset === undefined ? DEFAULT_DRAW_ORDER : undefined,
+            // 视觉先验只在**全量**装配时用：局部重跑（用户点名几个部件）时不带先验，
+            // 否则「重新自动定位」会变成「又回到我上次说的那个位置」，用户没法纠正它。
+            hints: subset === undefined ? job.layout.hints : undefined
+        });
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        if (subset === undefined)
+            fresh.layout.items = {};
+        for (const [name, result] of Object.entries(solved.placements)) {
+            fresh.layout.items[name] = {
+                x: result.x,
+                y: result.y,
+                width: result.width,
+                height: result.height,
+                scale: result.scale,
+                rotation: result.rotation,
+                z: drawRankOf(name),
+                score: result.score,
+                coverage: result.coverage,
+                matched: true,
+                manual: false
+            };
+        }
+        // 没匹配上的部件放到画布左下角的「待摆放」区，而不是 (0,0)：
+        // 界面上的方块可以拖动，用户直接把它们拖到正确位置即可。
+        const stagingScale = solved.hint || 0.2;
+        solved.failed.forEach((name, order) => {
+            if (fresh.layout.items[name] !== undefined)
+                return;
+            const node = fresh.parts.find((part) => part.name === name);
+            const width = Math.max(8, Math.round((node?.width ?? 64) * stagingScale));
+            const height = Math.max(8, Math.round((node?.height ?? 64) * stagingScale));
+            fresh.layout.items[name] = {
+                x: 6 + (order % 6) * 56,
+                y: Math.max(0, referenceDecoded.height - height - 4),
+                width,
+                height,
+                scale: stagingScale,
+                rotation: 0,
+                z: drawRankOf(name),
+                matched: false,
+                manual: false
+            };
+        });
+        if (subset === undefined) {
+            fresh.layout.hint = Number(solved.hint.toFixed(4));
+            fresh.layout.moved = solved.moved;
+            fresh.layout.resolved = solved.resolved;
+        }
+        fresh.layout.status = "ready";
+        fresh.layout.approved = false;
+        fresh.layout.updatedAt = Date.now();
+        // 匹配质量本身就是一个**信号**：如果整批部件的相似度都很低，通常不是「参数没调好」，
+        // 而是拆件图里的角色和参考图根本不是同一个（实测生图模型会把角色换成另一个：
+        // 原图是穿深蓝连衣裙的女仆，拆件图给的却是白短裤 + 光腿的一具裸身）。
+        // 这种情况下再怎么调匹配都是白费力气，必须直说，并给出真正能走通的两条路。
+        // 结构合理性检查：这些名字本身就带着人体结构信息，装配结果必须自洽。
+        // 分数高不代表摆得对——实测有一版「头」落在画面下半部分、裙摆放到了最上面，
+        // 平均相似度却还有 0.48，纯靠分数根本发现不了。人形的基本约束（头在最上面、
+        // 脚在最下面）是免费的强信号，违反它就直接判定自动定位不可信。
+        const verticalOrderProblem = (() => {
+            const centerYOf = (name) => {
+                const item = fresh.layout.items[name];
+                if (item === undefined || item.matched !== true || partHidden(fresh, name))
+                    return undefined;
+                return item.y + item.height / 2;
+            };
+            const headY = centerYOf("head");
+            const footY = centerYOf("left-foot") ?? centerYOf("right-foot");
+            const legY = centerYOf("left-upper-leg") ?? centerYOf("right-upper-leg");
+            if (headY === undefined)
+                return undefined;
+            if (footY !== undefined && headY > footY)
+                return "「头」被摆到了「脚」的下面";
+            if (legY !== undefined && headY > legY)
+                return "「头」被摆到了「大腿」的下面";
+            return undefined;
+        })();
+        const matchedScores = Object.values(solved.placements).map((item) => item.score);
+        const meanScore = matchedScores.length > 0 ? matchedScores.reduce((sum, value) => sum + value, 0) / matchedScores.length : 0;
+        fresh.layout.meanScore = Number(meanScore.toFixed(4));
+        const weak = solved.failed.length > 0 ? `这些部件没匹配上，需要人工摆放：${solved.failed.join("、")}` : undefined;
+        if (meanScore < 0.32 && matchedScores.length > 0) {
+            // 阈值定在 0.32：实测「拆件图是同一个角色」时均值约 0.38（而且受服装
+            // 裁片影响本身就不会很高），「角色被换成另一个」时约 0.28 且个别部件
+            // 直接匹配不上。低于 0.32 基本可以判定是后者，再调参数没有意义。
+            const hint = `整批部件的平均相似度只有 ${meanScore.toFixed(2)}，自动定位不可信。常见原因：` +
+                `① 拆件图里的角色与参考图不是同一个（生图模型在「拆件」时换掉服装 / 发型 / 体型）；` +
+                `② 部件是按「服装裁片」拆的（裙摆、袖子、领子），外观本来就只覆盖参考图的一小块。` +
+                `建议：① 用「部件 PNG」上传框传自己的部件（文件名即部件名，完全绕开生图）；` +
+                `② 或换更强的生图模型（设置 → 游戏素材大师 → 生图模型，实测 Seedream 5.0 Pro 明显更守角色设定）重新拆件；` +
+                `③ 也可以在下面的合成图上手工拖到正确位置。`;
+            appendJobLog(fresh.log, "warn", hint);
+            fresh.layout.error = weak === undefined ? hint : `${weak}；另外，${hint}`;
+        }
+        else if (verticalOrderProblem !== undefined) {
+            const hint = `自动定位结果明显不合理：${verticalOrderProblem}。这通常意味着拆件图里的部件与参考图对不上` +
+                `（部件可能是重新绘制的服装裁片，或角色被换过），继续相信自动结果反而更费时间。` +
+                `建议：① 直接用「部件 PNG」上传框传自己的部件（文件名即部件名）；② 在下面的合成图上手工拖到正确位置。`;
+            appendJobLog(fresh.log, "warn", hint);
+            fresh.layout.error = weak === undefined ? hint : `${weak}；另外，${hint}`;
+        }
+        else {
+            fresh.layout.error = weak;
+        }
+        fresh.rig = { status: "empty" };
+        fresh.atlas = { status: "empty" };
+        if (solved.hintedCount !== undefined && solved.hintedCount > 0) {
+            appendJobLog(fresh.log, "info", `本次装配用了 ${solved.hintedCount} 个视觉先验（限制在给定区域附近搜索）`);
+        }
+        appendJobLog(fresh.log, "info", `装配完成：命中 ${Object.keys(solved.placements).length}/${inputs.length}` +
+            (solved.failed.length > 0 ? `，未命中 ${solved.failed.join("、")}` : ""));
+        // 装配完成后把相似度并进质检结论。
+        //
+        // 重复件那部分复用拆件时算好的结果（这里没有像素，重算要再解一遍全部 PNG，
+        // 而这个函数每次拖动部件都会跑）。
+        const matches = Object.entries(fresh.layout.items ?? {})
+            // 同上：手工摆过的不算匹配质量。
+            .filter(([, item]) => item.manual !== true)
+            .map(([name, item]) => ({
+            name,
+            score: item.score,
+            matched: item.matched
+        }));
+        fresh.qa = buildQaState(assessParts({
+            duplicates: (fresh.qa?.duplicates ?? []).map((group) => ({
+                parts: group.parts,
+                minOverlap: group.minOverlap,
+                mirroredOverlap: group.mirroredOverlap,
+                symmetric: group.symmetric,
+                width: 0,
+                height: 0
+            })),
+            matches,
+            partCount: fresh.parts.filter((part) => part.hidden !== true && part.status === "ready").length,
+            expectedParts: fresh.qa?.expectedParts
+        }));
+        if (fresh.qa.expectedParts !== undefined)
+            fresh.qa.expectedParts = fresh.qa.expectedParts;
+        await writeRigJob(fresh);
+        await renderLayoutImages(jobId);
+        await writeLayoutJson(jobId);
+    }
+    catch (error) {
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        fresh.layout.status = "error";
+        fresh.layout.error = messageOf(error);
+        appendJobLog(fresh.log, "error", `装配定位失败：${messageOf(error)}`);
+        await writeRigJob(fresh);
+        throw error;
+    }
+}
+/** 手工调整某个部件的位置/尺寸/层级。 */
+/**
+ * 记录/清除视觉先验。
+ *
+ * 这是「自动摆位」的关键入口：先验把「全图盲搜」降级成「在指定区域里精修」。
+ * 先验来自多模态模型看一眼图（对话里就是 agent 自己），所以只要求**区域大致对**，
+ * 不要求精确——实测重画过的部件在错误位置也能拿到不低的分数，盲搜正是因此失手。
+ */
+export async function setRigLayoutHints(jobId, hints) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const current = { ...(job.layout.hints ?? {}) };
+    let touched = 0;
+    for (const [name, hint] of Object.entries(hints)) {
+        if (!job.parts.some((part) => part.name === name))
+            throw new Error(`没有这个部件：${name}`);
+        if (hint === null) {
+            delete current[name];
+            touched++;
+            continue;
+        }
+        const x = num(hint.x, NaN);
+        const y = num(hint.y, NaN);
+        const width = num(hint.width, NaN);
+        const height = num(hint.height, NaN);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+            throw new Error(`「${name}」的先验框不合法：需要 x / y / width / height 四个正数`);
+        }
+        current[name] = { x, y, width, height };
+        touched++;
+    }
+    job.layout.hints = Object.keys(current).length === 0 ? undefined : current;
+    invalidateFrom(job, "layout");
+    appendJobLog(job.log, "info", `已记录 ${touched} 个部件的视觉先验（装配时会限制在这些区域附近搜索）`);
+    await writeRigJob(job);
+    return { count: touched };
+}
+/**
+ * 批量写入手动装配结果。
+ *
+ * 为什么是批量：手动装配是**拖出来**的——一次拖动、一次键盘微调都会改一个部件，
+ * 逐条提交就是逐条「读盘 + 改 + 落盘 + 重出合成图」。重出合成图要解码参考图和全部
+ * 部件，一条几百毫秒，连续微调会明显卡顿。批量提交把「一次编辑动作」收敛成一次写盘
+ * 与一次渲染。
+ *
+ * 另外这里**允许为还不存在的摆放记录创建条目**：手动装配不该依赖先跑过自动定位
+ * （拆完件直接手工拼是完全合理的用法），所以记录不存在时按部件的原始像素尺寸建一条。
+ */
+export async function saveRigLayoutItems(jobId, patches) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (patches.length === 0)
+        return { touched: 0 };
+    let touched = 0;
+    for (const patch of patches) {
+        const part = job.parts.find((entry) => entry.name === patch.name);
+        if (part === undefined)
+            throw new Error(`没有这个部件：${patch.name}`);
+        let item = job.layout.items[patch.name];
+        if (item === undefined) {
+            // 没有记录：按部件的原始像素尺寸 + 全局缩放先验建一条，摆到画布左上角附近。
+            const hint = job.layout.hint ?? 0.5;
+            item = {
+                x: 0,
+                y: 0,
+                width: Math.max(1, Math.round((part.width ?? 64) * (patch.width === undefined ? hint : 1))),
+                height: Math.max(1, Math.round((part.height ?? 64) * (patch.height === undefined ? hint : 1))),
+                scale: hint,
+                rotation: 0,
+                z: drawRankOf(patch.name),
+                matched: false,
+                manual: false
+            };
+            job.layout.items[patch.name] = item;
+        }
+        if (Number.isFinite(patch.x))
+            item.x = Math.round(patch.x);
+        if (Number.isFinite(patch.y))
+            item.y = Math.round(patch.y);
+        if (Number.isFinite(patch.width))
+            item.width = Math.max(1, Math.round(patch.width));
+        if (Number.isFinite(patch.height))
+            item.height = Math.max(1, Math.round(patch.height));
+        if (Number.isFinite(patch.rotation))
+            item.rotation = num(patch.rotation, item.rotation);
+        if (Number.isFinite(patch.z))
+            item.z = Math.round(patch.z);
+        if (patch.placed === false) {
+            item.matched = false;
+            item.manual = true;
+        }
+        else {
+            item.matched = true;
+            item.manual = true;
+        }
+        // 位置由人给了之后，`score` 就不再代表任何东西——它描述的是**自动匹配**的质量。
+        // 留着它的后果是拆件质检会拿一个陈旧分数当"这次装配准不准"的证据
+        // （实测：手工摆对之后质检仍然报"平均相似度 0.326，不可信"）。
+        delete item.score;
+        delete item.coverage;
+        // scale 只是自动匹配的副产物，手动改过尺寸之后它就不再代表任何东西；
+        // 仍然按「最终宽度 / 部件原始宽度」回填，导出的 layout.json 才有意义。
+        if (part.width !== undefined && part.width > 0)
+            item.scale = Number((item.width / part.width).toFixed(4));
+        touched++;
+    }
+    // 手动装配会改动骨架上挂点的位置/尺寸，骨骼与图集必须重做——但只标一次。
+    job.layout.approved = false;
+    job.layout.status = "ready";
+    job.layout.error = undefined;
+    job.rig = { status: "empty" };
+    job.atlas = { status: "empty" };
+    appendJobLog(job.log, "info", `手动装配：更新了 ${touched} 个部件`);
+    await writeRigJob(job);
+    await renderLayoutImages(jobId);
+    await writeLayoutJson(jobId);
+    return { touched };
+}
+/** 单条改动（界面上的小操作、脚本与测试都用它）。 */
+export async function saveLayoutItem(jobId, name, patch) {
+    await saveRigLayoutItems(jobId, [{ name, ...patch }]);
+}
+/**
+ * 解码缓存。
+ *
+ * 手动装配是交互式的：每落一次位就要重出合成图，而重出图要解码参考图 + 全部部件。
+ * 每次 17 次 ffmpeg 调用（~1.4 秒）在连续微调时是灾难。部件文件在两次装配之间不会变，
+ * 所以按「路径 + mtime + 大小」缓存解码结果。
+ */
+const decodeCache = new Map();
+const DECODE_CACHE_LIMIT = 64;
+async function decodeCached(file, maxEdge = 2048) {
+    let key = file;
+    try {
+        const info = await stat(file);
+        key = `${file}:${info.mtimeMs}:${info.size}`;
+    }
+    catch {
+        /* 取不到 stat 就退化成按路径缓存 */
+    }
+    const hit = decodeCache.get(file);
+    if (hit !== undefined && hit.key === key)
+        return hit.image;
+    const decoded = await decodeToRgba(file, maxEdge);
+    if (decodeCache.size >= DECODE_CACHE_LIMIT) {
+        const oldest = decodeCache.keys().next().value;
+        if (oldest !== undefined)
+            decodeCache.delete(oldest);
+    }
+    decodeCache.set(file, { key, image: decoded });
+    return decoded;
+}
+export async function renderLayoutImages(jobId) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (job.source === undefined)
+        throw new Error("还没有角色参考图");
+    const referenceDecoded = await decodeCached(rigAssetPath(jobId, job.source.file));
+    const reference = { data: referenceDecoded.rgba, width: referenceDecoded.width, height: referenceDecoded.height };
+    const ordered = orderedItems(job);
+    const placed = [];
+    for (const [name, item] of ordered) {
+        const part = job.parts.find((entry) => entry.name === name);
+        if (part?.file === undefined)
+            continue;
+        const decoded = await decodeCached(rigAssetPath(jobId, part.file));
+        const scaled = resizeRgba({ data: decoded.rgba, width: decoded.width, height: decoded.height }, Math.max(1, item.width), Math.max(1, item.height));
+        // 旋转要真的画出来：手动装配里能改旋转，如果合成图忽略它，用户拧了半天看不到变化，
+        // 而导出的骨架也会和看到的不一致。旋转后尺寸会变大，按中心对齐回原来的框。
+        const rotated = Math.abs(item.rotation) < 0.01 ? scaled : rotateRgba(scaled, item.rotation);
+        placed.push({
+            name,
+            x: item.x + (item.width - rotated.width) / 2,
+            y: item.y + (item.height - rotated.height) / 2,
+            width: rotated.width,
+            height: rotated.height,
+            rgba: rotated
+        });
+    }
+    const composite = compositeParts(reference.width, reference.height, placed);
+    const comparison = sideBySide(reference, composite);
+    await mkdir(join(rigJobDir(jobId), "layout"), { recursive: true });
+    await writeFile(rigAssetPath(jobId, "layout/composite.png"), encodePng(composite.data, composite.width, composite.height));
+    await writeFile(rigAssetPath(jobId, "layout/comparison.png"), encodePng(comparison.data, comparison.width, comparison.height));
+    const fresh = await readRigJob(jobId);
+    if (fresh === undefined)
+        return;
+    fresh.layout.composite = "layout/composite.png";
+    fresh.layout.comparison = "layout/comparison.png";
+    await writeRigJob(fresh);
+}
+function normalizeHints(value) {
+    if (value === null || typeof value !== "object")
+        return undefined;
+    const out = {};
+    for (const [name, raw] of Object.entries(value)) {
+        const x = num(raw?.x, NaN);
+        const y = num(raw?.y, NaN);
+        const width = num(raw?.width, NaN);
+        const height = num(raw?.height, NaN);
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(width) || !Number.isFinite(height))
+            continue;
+        if (width <= 0 || height <= 0)
+            continue;
+        out[name] = { x, y, width, height };
+    }
+    return Object.keys(out).length === 0 ? undefined : out;
+}
+/** 部件是否被用户隐藏。 */
+function partHidden(job, name) {
+    return job.parts.find((part) => part.name === name)?.hidden === true;
+}
+/** 按绘制顺序（z 升序）列出已经摆放好的部件。 */
+function orderedItems(job) {
+    return Object.entries(job.layout.items)
+        .filter(([name]) => {
+        const part = job.parts.find((entry) => entry.name === name);
+        return part?.status === "ready" && part.hidden !== true;
+    })
+        .sort((a, b) => a[1].z - b[1].z || a[0].localeCompare(b[0]));
+}
+/** 导出 layout.json（供外部工具或人工核对）。 */
+export async function writeLayoutJson(jobId) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const parts = {};
+    for (const [name, item] of Object.entries(job.layout.items)) {
+        parts[name] = {
+            x: item.x,
+            y: item.y,
+            width: item.width,
+            height: item.height,
+            scale: item.scale,
+            rotation: item.rotation,
+            z_index: item.z,
+            score: item.score,
+            coverage: item.coverage,
+            matched: item.matched,
+            manual: item.manual === true
+        };
+    }
+    const payload = {
+        reference_image: job.source?.file ?? null,
+        canvas_width: job.source?.width ?? 0,
+        canvas_height: job.source?.height ?? 0,
+        hint_scale: job.layout.hint ?? null,
+        z_order: orderedItems(job).map(([name]) => name),
+        parts
+    };
+    await writeFile(rigAssetPath(jobId, "layout/layout.json"), `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+}
+// ── 阶段③：骨骼与动画 ──────────────────────────────────────────────────
+export function startRig(jobId) {
+    try {
+        assertIdle(jobId, "rig", "骨骼构建");
+    }
+    catch (error) {
+        return { started: false, reason: messageOf(error) };
+    }
+    const started = kick(jobId, "rig", () => buildRigOutput(jobId));
+    return started ? { started: true } : { started: false, reason: "骨骼构建已在进行中" };
+}
+/**
+ * 生成 `skeleton.json` 与自包含预览 `preview.html`。
+ *
+ * 这一步不调任何模型：骨骼位置/朝向由装配结果直接算出来，动画是查表生成的。
+ */
+export async function buildRigOutput(jobId) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    if (job.source === undefined)
+        throw new Error("还没有角色参考图");
+    const ordered = orderedItems(job);
+    if (ordered.length === 0)
+        throw new Error("还没有摆放好的部件，请先在第 ② 步装配定位");
+    job.rig.status = "running";
+    job.rig.error = undefined;
+    await writeRigJob(job);
+    try {
+        // 语义是骨骼推导的输入；到这里还缺就补一次（例如用户全程没打开过语义页）。
+        const filled = ensurePartSemantics(job);
+        if (filled > 0)
+            appendJobLog(job.log, "info", `构建骨骼前补齐了 ${filled} 个部件的语义`);
+        const placedParts = ordered.map(([name, item]) => {
+            const node = job.parts.find((part) => part.name === name);
+            return {
+                name,
+                file: node?.file ?? `parts/${name}.png`,
+                x: item.x,
+                y: item.y,
+                width: item.width,
+                height: item.height,
+                scale: item.scale,
+                rotation: item.rotation,
+                z: item.z,
+                // 语义已补齐：没有语义父级也属于已确定的 root，不再按名字兜底。
+                parent: node?.parent ?? null,
+                proximal: node?.proximal,
+                distal: node?.distal,
+                // 三通道的中间那一层：人的手工偏置，任何自动重跑都不碰它。
+                offset: job.boneOffsets?.[name]
+            };
+        });
+        const { spine, bones, warnings, animationsRaw } = buildSkeleton({
+            name: job.name,
+            canvasWidth: job.source.width,
+            canvasHeight: job.source.height,
+            parts: placedParts,
+            animationIds: job.settings.animations,
+            animationSettings: job.animationSettings,
+            // 手工编辑过的动画顶掉预设实例。传的是**简写**，转换只发生一次。
+            customAnimations: job.animations,
+            // IK 约束：目标骨不存在时 buildSkeleton 会补一根可拖的点。
+            constraints: job.constraints,
+            // 蒙皮网格：只有列在这里的部件才细分（其余仍走整块贴图渲染）。
+            meshes: job.meshes,
+            // FFD 变形：导出时被采样成 deform/ffd 时间轴（每个动画各一份、首尾闭合）。
+            deforms: job.deforms,
+            // Path 约束：点用参考图像素，由 buildSkeleton 转成骨骼世界坐标。
+            paths: job.paths
+        });
+        // **写盘之前先校验 wire format**。这四条地雷的共同特征是「插件里一路绿灯，
+        // 到引擎里才发现」：`angle` 让骨骼不转、bezier 少几个数让骨架渲染一帧后消失、
+        // 控制点不绝对化让运动突跳。宁可这一步失败，也不要交出一份坏资源。
+        const wireReport = validateSpineWire(spine);
+        const loopReport = validateAnimationLoops(spine, 
+        // 手工动画的「是否循环」由数据自己说，不能拿预设当标准：
+        // 用户故意做一台不闭合的「一次性」动作是完全合理的。
+        Object.fromEntries(Object.entries(job.animations ?? {}).map(([id, value]) => [id, value.loop])));
+        if (!wireReport.ok || !loopReport.ok) {
+            const all = [...wireReport.errors, ...loopReport.errors];
+            throw new Error(`skeleton.json 未通过导出前校验（${all.length} 处）：` +
+                all.slice(0, 3).map((issue) => `${issue.where} ${issue.message}`).join("；"));
+        }
+        await mkdir(join(rigJobDir(jobId), "rig"), { recursive: true });
+        await writeFile(rigAssetPath(jobId, "rig/skeleton.json"), `${JSON.stringify(spine, null, 2)}\n`, "utf8");
+        // 同一份骨架再出一份 DragonBones 5.5（`_ske.json`）。
+        //
+        // 两条导出路径共用**布局与简写动画**，只在字段名与编码器上分岔——尤其是
+        // curve：Spine 是绝对量、DragonBones 是 0~1 归一化，不能复用同一份已转换
+        // 的结果（见 `rigexport.ts` 的文件头注释）。
+        const dragonBones = buildDragonBonesSkeleton({
+            name: job.name,
+            canvasWidth: job.source.width,
+            canvasHeight: job.source.height,
+            spine,
+            animations: animationsRaw
+        });
+        const dragonBonesReport = validateDragonBones(dragonBones);
+        if (!dragonBonesReport.ok) {
+            throw new Error(`DragonBones 骨架未通过导出前校验（${dragonBonesReport.errors.length} 处）：` +
+                dragonBonesReport.errors.slice(0, 3).map((issue) => `${issue.where} ${issue.message}`).join("；"));
+        }
+        await mkdir(join(rigJobDir(jobId), "export/dragonbones"), { recursive: true });
+        const dragonBonesFile = "export/dragonbones/skeleton_ske.json";
+        await writeFile(rigAssetPath(jobId, dragonBonesFile), `${JSON.stringify(dragonBones, null, 2)}\n`, "utf8");
+        // 预览把部件图内联成 data URI：离线打开也能看，不依赖 CDN。
+        const images = [];
+        for (const [name] of ordered) {
+            const part = job.parts.find((entry) => entry.name === name);
+            if (part?.file === undefined)
+                continue;
+            const bytes = await readFile(rigAssetPath(jobId, part.file));
+            images.push({ name, dataUri: `data:${mimeOf(part.file)};base64,${bytes.toString("base64")}` });
+        }
+        const html = buildPreviewHtml({
+            title: `${job.name} · 骨骼动画预览`,
+            spine,
+            images,
+            defaultAnimation: job.settings.animations.includes("idle") ? "idle" : job.settings.animations[0],
+            // FFD 变形参数内联进预览：波形位移要在播放时**逐帧**算，把参数带过去比
+            // 预烘焙一串位移更省体积，也不会在改幅度之后留下一堆过期数据。
+            deforms: job.deforms,
+            // 路径点在这里就转成**骨骼世界坐标**（y 向上）：预览既不知道画布尺寸、
+            // 也不知道 toWorld 的约定，让它自己转迟早会转错——而且转错的表现是
+            // 「骨骼排到画面外」，很难联想到是坐标系的事。
+            paths: previewPathsOf(job, spine)
+        });
+        await writeFile(rigAssetPath(jobId, "rig/preview.html"), html, "utf8");
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        fresh.rig = {
+            status: "ready",
+            approved: false,
+            skeleton: "rig/skeleton.json",
+            preview: "rig/preview.html",
+            bones: bones.length,
+            slots: spine.slots.length,
+            animations: Object.keys(spine.animations),
+            // 几何推导的告警 + 导出校验的提示合并在一起给界面看。
+            warnings: [
+                ...warnings,
+                ...wireReport.warnings.map((issue) => `${issue.where} ${issue.message}`),
+                ...loopReport.warnings.map((issue) => `${issue.where} ${issue.message}`),
+                ...dragonBonesReport.warnings.map((issue) => `${issue.where} ${issue.message}`)
+            ],
+            // 第二条导出路径（同一个 RigDocument 的另一种写法）。
+            dragonBones: { skeleton: dragonBonesFile },
+            // 派生数据：给界面展示「这根骨头现在是什么样、我挪了多少」。
+            boneList: bones.map((bone) => ({
+                name: bone.name,
+                parent: bone.parent,
+                x: bone.x,
+                y: bone.y,
+                rotation: bone.rotation,
+                length: bone.length,
+                offset: job.boneOffsets?.[bone.name]
+            })),
+            updatedAt: Date.now()
+        };
+        fresh.atlas = { status: "empty" };
+        appendJobLog(fresh.log, "info", `骨骼构建完成：${bones.length} 根骨骼 / ${spine.slots.length} 个挂点 / 动画 ${Object.keys(spine.animations).join("、")}` +
+            `；Spine 4.2 校验通过${wireReport.warnings.length > 0 ? `（${wireReport.warnings.length} 条提示）` : ""}`);
+        await writeRigJob(fresh);
+    }
+    catch (error) {
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        fresh.rig = { ...fresh.rig, status: "error", error: messageOf(error) };
+        appendJobLog(fresh.log, "error", `骨骼构建失败：${messageOf(error)}`);
+        await writeRigJob(fresh);
+        throw error;
+    }
+}
+// ── 阶段④：图集 ────────────────────────────────────────────────────────
+export function startAtlas(jobId) {
+    try {
+        assertIdle(jobId, "atlas", "图集打包");
+    }
+    catch (error) {
+        return { started: false, reason: messageOf(error) };
+    }
+    const started = kick(jobId, "atlas", () => buildAtlas(jobId));
+    return started ? { started: true } : { started: false, reason: "图集打包已在进行中" };
+}
+/**
+ * 打包 Spine 纹理图集。
+ *
+ * 部件按**装配后的尺寸**入图，这样 `.atlas` 里的区域尺寸和 `skeleton.json` 里
+ * 挂点的 `width` / `height` 完全一致——导入 Spine 时不会出现「图对不上骨骼」。
+ */
+export async function buildAtlas(jobId) {
+    const job = await readRigJob(jobId);
+    if (job === undefined)
+        throw new Error(`任务不存在：${jobId}`);
+    const ordered = orderedItems(job);
+    if (ordered.length === 0)
+        throw new Error("还没有摆放好的部件，请先在第 ② 步装配定位");
+    job.atlas.status = "running";
+    job.atlas.error = undefined;
+    await writeRigJob(job);
+    try {
+        const images = [];
+        for (const [name, item] of ordered) {
+            const part = job.parts.find((entry) => entry.name === name);
+            if (part?.file === undefined)
+                continue;
+            const decoded = await decodeToRgba(rigAssetPath(jobId, part.file), 2048);
+            images.push({
+                name,
+                rgba: resizeRgba({ data: decoded.rgba, width: decoded.width, height: decoded.height }, Math.max(1, item.width), Math.max(1, item.height))
+            });
+        }
+        if (images.length === 0)
+            throw new Error("没有可打包的部件");
+        // 裁掉每件的透明边再入图，并把**真实的 orig / offset** 写进 .atlas。
+        // 挂点的 width/height 仍是原尺寸（= orig），所以渲染结果不变——
+        // 参考项目恒写 `orig == size` 且 `offset: 0,0`，等于把透明边一起塞进图集。
+        const packed = packAtlas(images.map((image) => {
+            const bounds = alphaBounds(image.rgba);
+            if (bounds === undefined) {
+                return { name: image.name, width: image.rgba.width, height: image.rgba.height };
+            }
+            return {
+                name: image.name,
+                width: bounds.width,
+                height: bounds.height,
+                origWidth: image.rgba.width,
+                origHeight: image.rgba.height,
+                offsetX: -bounds.x,
+                offsetY: -bounds.y
+            };
+        }), { padding: 2, maxSize: ATLAS_MAX_SIZE, pageName: "skeleton.png" });
+        await mkdir(join(rigJobDir(jobId), "atlas"), { recursive: true });
+        const pageFiles = [];
+        for (const page of packed.pages) {
+            // 页名由 `packAtlas` 统一给（`skeleton.png` / `skeleton2.png`…），
+            // 磁盘文件名与 `.atlas` 第一行严格一致——两边各起一次名字迟早会对不上。
+            const fileName = page.name;
+            const canvas = createRgba(page.width, page.height);
+            for (const placement of page.placements) {
+                const image = images.find((entry) => entry.name === placement.name);
+                if (image === undefined)
+                    continue;
+                blitOpaque(canvas, cropRgba(image.rgba, placement), placement.x, placement.y);
+            }
+            await writeFile(rigAssetPath(jobId, `atlas/${fileName}`), encodePng(canvas.data, canvas.width, canvas.height));
+            pageFiles.push(`atlas/${fileName}`);
+        }
+        // 写盘之前先校验：图集对不上骨架的产物是废的，不能交出去。
+        const expectedNames = images.map((image) => image.name);
+        const atlasReport = validateAtlas(packed.pages, { expected: expectedNames, maxSize: ATLAS_MAX_SIZE });
+        if (!atlasReport.ok) {
+            throw new Error(`图集校验失败：${atlasReport.errors.map((issue) => `${issue.where} ${issue.message}`).join("；")}`);
+        }
+        // 骨架若已生成，顺带核对「每个挂点都有对应区域」。
+        if (job.rig.skeleton !== undefined) {
+            try {
+                const spine = JSON.parse(await readFile(rigAssetPath(jobId, job.rig.skeleton), "utf8"));
+                const match = validateSkeletonAtlasMatch(spine, packed.pages);
+                if (!match.ok) {
+                    throw new Error(`骨架与图集不一致：${match.errors.map((issue) => `${issue.where} ${issue.message}`).join("；")}`);
+                }
+            }
+            catch (error) {
+                // 骨架文件读不出来不算图集的错，但要说清楚。
+                if (error instanceof Error && error.message.startsWith("骨架与图集不一致"))
+                    throw error;
+                appendJobLog(job.log, "warn", `跳过骨架↔图集一致性检查：${messageOf(error)}`);
+            }
+        }
+        await writeFile(rigAssetPath(jobId, "atlas/skeleton.atlas"), buildAtlasText(packed.pages), "utf8");
+        // 同一份图集再出一份 DragonBones 的贴图描述（`_tex.json`，逐页一份）。
+        // 两边必须同源：分开各装一次箱，坐标迟早对不上，而运行时的表现只是「画错位」。
+        const textureFiles = [];
+        for (const page of packed.pages) {
+            const base = page.name.replace(/\.png$/i, "");
+            const texture = buildDragonBonesTexture(page, { imagePath: page.name, name: base });
+            const textureReport = validateDragonBonesTexture(texture);
+            if (!textureReport.ok) {
+                throw new Error(`DragonBones 贴图描述未通过校验：${textureReport.errors.map((issue) => `${issue.where} ${issue.message}`).join("；")}`);
+            }
+            for (const issue of textureReport.warnings) {
+                appendJobLog(job.log, "warn", `DragonBones 贴图提示：${issue.where} ${issue.message}`);
+            }
+            await writeFile(rigAssetPath(jobId, `atlas/${base}_tex.json`), `${JSON.stringify(texture, null, 2)}\n`, "utf8");
+            textureFiles.push(`atlas/${base}_tex.json`);
+        }
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        const first = packed.pages[0];
+        const regionCount = packed.pages.reduce((sum, page) => sum + page.placements.length, 0);
+        fresh.atlas = {
+            status: "ready",
+            approved: false,
+            image: "atlas/skeleton.png",
+            text: "atlas/skeleton.atlas",
+            width: first.width,
+            height: first.height,
+            regions: regionCount,
+            pages: packed.pages.map((page, index) => ({
+                file: pageFiles[index],
+                width: page.width,
+                height: page.height,
+                regions: page.placements.length
+            })),
+            warnings: atlasReport.warnings.map((issue) => `${issue.where} ${issue.message}`),
+            // DragonBones 侧的派生物：`.atlas` 的孪生兄弟，同一次装箱出来的。
+            dragonBones: { textures: textureFiles },
+            updatedAt: Date.now()
+        };
+        for (const warning of atlasReport.warnings) {
+            appendJobLog(fresh.log, "warn", `图集提示：${warning.where} ${warning.message}`);
+        }
+        const trimmed = packed.pages
+            .flatMap((page) => page.placements)
+            .filter((item) => item.origWidth !== undefined && item.origWidth !== item.width).length;
+        appendJobLog(fresh.log, "info", `图集打包完成：${packed.pages.length} 页，共 ${regionCount} 个区域` +
+            (packed.pages.length > 1 ? `（${packed.pages.map((page) => `${page.width}×${page.height}`).join(" + ")}）` : `（${first.width}×${first.height}）`) +
+            (trimmed > 0 ? `；${trimmed} 个部件裁掉了透明边` : ""));
+        await writeRigJob(fresh);
+    }
+    catch (error) {
+        const fresh = await readRigJob(jobId);
+        if (fresh === undefined)
+            return;
+        fresh.atlas = { ...fresh.atlas, status: "error", error: messageOf(error) };
+        appendJobLog(fresh.log, "error", `图集打包失败：${messageOf(error)}`);
+        await writeRigJob(fresh);
+        throw error;
+    }
+}
+/** 图集里的区域互不重叠，直接整块覆盖写入即可（不走 source-over 混合）。 */
+function blitOpaque(dst, src, x, y) {
+    for (let row = 0; row < src.height; row++) {
+        const ty = y + row;
+        if (ty < 0 || ty >= dst.height)
+            continue;
+        src.data.copy(dst.data, (ty * dst.width + x) * 4, row * src.width * 4, (row + 1) * src.width * 4);
+    }
+}
+/**
+ * 按 placement 的 orig/offset 从原图裁出**要入图的那一块**。
+ *
+ * `offset` 是 Spine 语义（裁剪矩形相对原图左上角的偏移，通常是负数），
+ * 所以原图里的起点是 `-offset`；没写 offset 就是整张。
+ */
+function cropRgba(src, placement) {
+    const offsetX = placement.offsetX ?? 0;
+    const offsetY = placement.offsetY ?? 0;
+    if (offsetX === 0 && offsetY === 0 && placement.width === src.width && placement.height === src.height)
+        return src;
+    const out = createRgba(placement.width, placement.height);
+    for (let row = 0; row < placement.height; row++) {
+        const sy = -offsetY + row;
+        if (sy < 0 || sy >= src.height)
+            continue;
+        for (let column = 0; column < placement.width; column++) {
+            const sx = -offsetX + column;
+            if (sx < 0 || sx >= src.width)
+                continue;
+            const from = (sy * src.width + sx) * 4;
+            const to = (row * placement.width + column) * 4;
+            out.data[to] = src.data[from];
+            out.data[to + 1] = src.data[from + 1];
+            out.data[to + 2] = src.data[from + 2];
+            out.data[to + 3] = src.data[from + 3];
+        }
+    }
+    return out;
+}
+export { RIG_ANIMATIONS, boxMask };

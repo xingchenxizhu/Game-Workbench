@@ -1,0 +1,2105 @@
+/**
+ * 宿主半区冒烟测试：用真实 cordis Context 挂载插件，把远程服务的每个方法
+ * 都跑一遍，并用真实 HTTP 服务器验证静态资源路由（含 Range 与目录穿越防护）。
+ *
+ *   node scripts/verify-host.mjs
+ *
+ * 全部数据写在临时 DSH_HOME 下，不会碰用户真正的项目目录。
+ * 生图那一步会用假 Key 真实打一次火山方舟接口，预期拿到鉴权失败——
+ * 这正是要验证的「错误能一路冒到节点状态里」。
+ */
+
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { inflateRawSync } from "node:zlib";
+import { createHash } from "node:crypto";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createServer } from "node:http";
+
+const HOME = await mkdtemp(join(tmpdir(), "dsh-gmm-verify-"));
+process.env.DSH_HOME = HOME;
+
+const { Context } = await import("@deepseek-ai/cordis");
+const plugin = await import("../lib/index.js");
+const { encodePng } = await import("../lib/png.js");
+
+const failures = [];
+let checks = 0;
+function check(name, ok, detail) {
+  checks++;
+  console.log(`  ${ok ? "✓" : "✗"} ${name}${detail === undefined ? "" : ` — ${detail}`}`);
+  if (!ok) failures.push(name);
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * 极简 ZIP 读取器（**只给自检用**）。
+ *
+ * 只断言「zip 存在、字节数不小」是不够的：中央目录偏移写错、CRC 写错、
+ * deflate 流被截断时那种断言照样通过。这里走真解包：中央目录 → 本地头 →
+ * inflateRaw → 校验长度与 CRC，于是「打包出来的图片包能解开」才是真的。
+ */
+const ZIP_CRC_TABLE = (() => {
+  const table = new Int32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    table[n] = c;
+  }
+  return table;
+})();
+function zipCrc32(buffer) {
+  let c = 0xffffffff;
+  for (let i = 0; i < buffer.length; i++) c = ZIP_CRC_TABLE[(c ^ buffer[i]) & 0xff] ^ (c >>> 8);
+  return (c ^ 0xffffffff) >>> 0;
+}
+function readZip(buffer) {
+  const EOCD = buffer.lastIndexOf(Buffer.from([0x50, 0x4b, 0x05, 0x06]));
+  if (EOCD < 0) throw new Error("不是 zip：找不到 EOCD");
+  const count = buffer.readUInt16LE(EOCD + 10);
+  let offset = buffer.readUInt32LE(EOCD + 16);
+  const out = new Map();
+  for (let i = 0; i < count; i++) {
+    if (buffer.readUInt32LE(offset) !== 0x02014b50) throw new Error("中央目录签名不对");
+    const method = buffer.readUInt16LE(offset + 10);
+    const crc = buffer.readUInt32LE(offset + 16);
+    const compSize = buffer.readUInt32LE(offset + 20);
+    const rawSize = buffer.readUInt32LE(offset + 24);
+    const nameLen = buffer.readUInt16LE(offset + 28);
+    const extraLen = buffer.readUInt16LE(offset + 30);
+    const commentLen = buffer.readUInt16LE(offset + 32);
+    const localAt = buffer.readUInt32LE(offset + 42);
+    const name = buffer.toString("utf8", offset + 46, offset + 46 + nameLen);
+    if (buffer.readUInt32LE(localAt) !== 0x04034b50) throw new Error(`本地头签名不对：${name}`);
+    const start = localAt + 30 + buffer.readUInt16LE(localAt + 26) + buffer.readUInt16LE(localAt + 28);
+    const payload = buffer.subarray(start, start + compSize);
+    const data = method === 0 ? Buffer.from(payload) : inflateRawSync(payload);
+    if (data.length !== rawSize) throw new Error(`解出来的长度不对：${name}`);
+    if (zipCrc32(data) !== crc) throw new Error(`CRC 不对：${name}`);
+    out.set(name, data);
+    offset += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
+async function main() {
+  console.log(`临时 DSH_HOME: ${HOME}\n`);
+
+  // ── 1. 挂载 ────────────────────────────────────────────────────────────
+  console.log("1) 挂载插件");
+  const ctx = new Context();
+  const captured = { manifest: null, routes: [] };
+  ctx.provide("typert", {
+    register: (manifest) => {
+      captured.manifest = manifest;
+      return () => {};
+    }
+  });
+  ctx.provide("webServer", {
+    register: (route) => {
+      captured.routes.push(route);
+      return () => {};
+    }
+  });
+
+  check("导出 name", plugin.name === "dsh-game-material-master", plugin.name);
+  check("导出 inject", Array.isArray(plugin.inject) && plugin.inject.includes("typert"), JSON.stringify(plugin.inject));
+  // webServer 必须是硬依赖：它 listen 成功后才可用，而 apply 与它几乎同时发生。
+  // 只靠 ctx.get() 探测会拿到 undefined，路由永远不注册（表现为资源请求全 404）。
+  check("inject 把 webServer 声明为硬依赖", plugin.inject.includes("webServer"), JSON.stringify(plugin.inject));
+
+  plugin.apply(ctx);
+  check("apply 未抛异常", true);
+  check("注册了 typert manifest", captured.manifest !== null);
+  check("注册了一条 prefix 路由", captured.routes.length === 1 && captured.routes[0].kind === "prefix", JSON.stringify(captured.routes.map((r) => r.path)));
+
+  const invocations = captured.manifest?.invocations ?? [];
+  // 方法数是**清单完整性**的锚点：新增 / 删除远程方法时必须同步改这个数字。
+  // 模块六重做时删了 4 个（族 / 多地图）加了 2 个（一键生成 / 内置素材），132 → 130。
+  // 八方向图加「本地自选视频」与「中间图片打包」两个方法，130 → 132。
+  // 生图后端加「自定义后端连接测试」（testCustomImage），132 → 133；
+  // 本地 ComfyUI 视频后端新增 testComfy，133 → 134；
+  // 「AI 生成素材」新增 composeMapAsset（整理一批帧 → 一张待确认的素材图），134 → 135。
+  // 「原地重烘」新增 recomposeMapTileset（按现在的规则重烘一张素材，保留图块序号），135 → 136。
+  // 音效生成（模块八）新增 13 个方法（testSfx + 12 个 sfx 方法），163 → 176。
+  check("manifest 方法数为 179（新增远程方法时同步改这个数）", invocations.length === 179, `实际 ${invocations.length}`);
+  const ids = new Set(invocations.map((i) => i.id));
+  check("方法 id 唯一", ids.size === invocations.length);
+  check("所有方法都声明在 gameStudio 服务下", invocations.every((i) => i.service === "gameStudio" && i.namespace === "gameStudio"));
+  const badCodecs = invocations.flatMap((invocation) => {
+    const codecs = [
+      ["result", invocation.result],
+      ...invocation.parameters.map((parameter) => [parameter.name, parameter.codec])
+    ];
+    return codecs
+      .filter(([, codec]) => codec?.mode === "strict" && typeof codec.create !== "function")
+      .map(([label]) => `${invocation.method}/${label}`);
+  });
+  check("strict codec 都带 create() 工厂", badCodecs.length === 0, badCodecs.join(",") || "全部命中");
+
+  const studio = ctx.get("gameStudio");
+  check("gameStudio 服务已提供", studio !== undefined && typeof studio.getConfig === "function");
+  const missing = invocations.map((i) => i.method).filter((m) => typeof studio[m] !== "function");
+  check("manifest 里的每个方法都真实存在", missing.length === 0, missing.join(",") || "全部命中");
+
+  // ── 1.5 方向语义（方位 ↔ 脸部可见性）────────────────────────────────────
+  // 这是上一版真正出错的地方：西北/东北写成了「面对镜头」、东南/西南写成了
+  // 「背对镜头」，正好反了；而且「朝画面左上方」会被模型理解成抬头仰视。
+  // 光读代码看不出对错，所以把「方位 → 看得见什么」固化成断言。
+  console.log("1.5) 方向语义（方位 ↔ 脸部可见性）");
+  const { DIRECTIONS, DEFAULT_ROW_ORDER, DEFAULT_IMAGE_PROMPT, defaultImagePrompts } = await import("../lib/directions.js");
+  const byKey = Object.fromEntries(DIRECTIONS.map((d) => [d.key, d]));
+  const prompts = defaultImagePrompts();
+
+  check("八个方向都有罗盘方位", DIRECTIONS.length === 8 && DIRECTIONS.every((d) => typeof d.compass === "string"));
+  check("罗盘方位不重复", new Set(DIRECTIONS.map((d) => d.compass)).size === 8);
+  check("南 = 正面、北 = 背面", byKey.front.compass === "S" && byKey.back.compass === "N");
+
+  // 看不见脸：北 / 东北 / 西北
+  for (const key of ["back", "upLeft", "upRight"]) {
+    check(`${byKey[key].compass}（${byKey[key].label}）要求完全看不到脸`, /完全看不到脸/.test(prompts[key]) && /不得出现眼睛/.test(prompts[key]));
+  }
+  // 侧脸：东 / 西
+  for (const key of ["left", "right"]) {
+    const text = prompts[key];
+    check(`${byKey[key].compass}（${byKey[key].label}）要求只看到一侧脸`, /侧脸/.test(text) && /看不到[左右]眼/.test(text));
+  }
+  // 看得见脸：南 / 东南 / 西南
+  for (const key of ["front", "downLeft", "downRight"]) {
+    check(`${byKey[key].compass}（${byKey[key].label}）要求看得见正脸`, /正脸/.test(prompts[key]));
+  }
+  // 东南朝右转、西南朝左转，别镜像弄反
+  check(
+    "东南 = 转向画面右侧、鼻尖朝右下",
+    /转向画面右侧/.test(prompts.downRight) && /鼻尖指向画面右下/.test(prompts.downRight) && /左耳比右耳更靠近镜头/.test(prompts.downRight)
+  );
+  check(
+    "西南 = 转向画面左侧、鼻尖朝左下",
+    /转向画面左侧/.test(prompts.downLeft) && /鼻尖指向画面左下/.test(prompts.downLeft) && /右耳比左耳更靠近镜头/.test(prompts.downLeft)
+  );
+  // 东西必须是**纯侧面**，而且不能只写「看得到半张脸」——那样模型会画成正面
+  check(
+    "东 = 身体完全侧对镜头、鼻尖朝右、看不到左眼",
+    /完全侧对镜头/.test(prompts.right) && /鼻尖指向画面右侧/.test(prompts.right) && /看不到左眼/.test(prompts.right)
+  );
+  check(
+    "西 = 身体完全侧对镜头、鼻尖朝左、看不到右眼",
+    /完全侧对镜头/.test(prompts.left) && /鼻尖指向画面左侧/.test(prompts.left) && /看不到右眼/.test(prompts.left)
+  );
+  // 「剪影」会被模型按字面执行成纯黑轮廓，绝不能再出现在提示词里
+  check(
+    "提示词里不出现「剪影」这种会被字面执行的词",
+    DIRECTIONS.every((d) => !/剪影/.test(prompts[d.key]))
+  );
+  // 斜向必须与正背面 / 正侧面区分开，否则四个斜向会长得几乎一样
+  check(
+    "东北/西北写明是斜背、区别于正背面",
+    ["upLeft", "upRight"].every((k) => /后背偏[左右]的一侧/.test(prompts[k]) && /不是正背面/.test(prompts[k]))
+  );
+  // 「剪影」会被模型按字面执行成纯黑轮廓——实测踩过，不能再出现
+  check(
+    "提示词里不出现会被字面执行的「剪影」",
+    DIRECTIONS.every((d) => !/剪影/.test(prompts[d.key]))
+  );
+  check("正北明确要求正背面", /正背面/.test(prompts.back));
+  check("正南明确要求不要侧身", /不要侧身/.test(prompts.front));
+
+  // 防俯仰：这是上一版另一个坑
+  check(
+    "所有方向都禁止抬头/低头",
+    DIRECTIONS.every((d) => /禁止抬头、低头、仰视、俯视/.test(prompts[d.key]))
+  );
+  check(
+    "朝向与可见部位分成两个占位符",
+    DEFAULT_IMAGE_PROMPT.includes("{facing}") && DEFAULT_IMAGE_PROMPT.includes("{visibility}")
+  );
+  check(
+    "八个方向都显式写明画面上方为北",
+    ["back", "downLeft", "downRight", "upLeft", "upRight", "left", "right"].every((k) => /画面上方为北|画面左上|画面右上|画面左下方|画面右下方|画面左侧为西|画面右侧为东/.test(prompts[k]))
+  );
+
+  // 依赖关系：背面斜向派生自北、正面斜向派生自南
+  check("东北/西北派生自背面（北）", byKey.upLeft.refs.includes("back") && byKey.upRight.refs.includes("back"));
+  check("东南/西南派生自正面（南）", byKey.downLeft.refs.includes("front") && byKey.downRight.refs.includes("front"));
+  check("东/西同时参考正面与背面", byKey.left.refs.length === 2 && byKey.right.refs.length === 2);
+
+  check(
+    "默认行序是罗盘顺时针 N→NE→E→SE→S→SW→W→NW",
+    JSON.stringify(DEFAULT_ROW_ORDER) === JSON.stringify(["back", "upRight", "right", "downRight", "front", "downLeft", "left", "upLeft"]),
+    DEFAULT_ROW_ORDER.join(",")
+  );
+
+  // ── 2. 配置 ────────────────────────────────────────────────────────────
+  console.log("2) 配置读写与脱敏");
+  const initial = await studio.getConfig();
+  // 默认模型是 5.0 Flash。**不要改回 4.0**：实测 4.0 会把 2:1 等距菱形画成近正方形
+  // （比例 1.058）并且只输出 JPEG，地图地块模块依赖这个几何，用它必然量不出菱形。
+  check("默认使用 Seedream 5.0 Flash", initial.arkModel === "doubao-seedream-5-0-flash-260915", initial.arkModel);
+  check("ffmpeg 探测通过", initial.ffmpeg?.ok === true, initial.ffmpeg?.version ?? initial.ffmpeg?.error);
+  check("默认单格 256×256", initial.cellWidth === 256 && initial.cellHeight === 256);
+  check("默认每段抽 8 帧", initial.frameCount === 8);
+  check("默认行序为 8 个方向", Array.isArray(initial.rowOrder) && initial.rowOrder.length === 8);
+  check("默认开启自动裁剪", initial.autoCrop === true);
+  check("默认抽帧工作尺寸 768", initial.workingLongEdge === 768, String(initial.workingLongEdge));
+  check("默认开启背景空间分割", initial.bgTolerance === 90, String(initial.bgTolerance));
+  check("初始未配置 Key", initial.arkApiKeySet === false && initial.minimaxApiKeySet === false);
+  // 功能管理：默认全部模块可见；写进去的非法 key 要被丢掉、顺序要固定
+  // （顺序固定是为了让「同一组勾选」永远序列化成同一份 JSON）。
+  check("默认没有任何被隐藏的功能", JSON.stringify(initial.hiddenModules) === JSON.stringify([]), JSON.stringify(initial.hiddenModules));
+  const hiddenSaved = await studio.saveConfig({ hiddenModules: ["tile", "nope", "sprite", "tile"] });
+  check(
+    "hiddenModules 落盘时收敛成合法子集并按固定顺序",
+    JSON.stringify(hiddenSaved.hiddenModules) === JSON.stringify(["sprite", "tile"]),
+    JSON.stringify(hiddenSaved.hiddenModules)
+  );
+  check("重新读配置仍是同一份", JSON.stringify((await studio.getConfig()).hiddenModules) === JSON.stringify(["sprite", "tile"]));
+  const hiddenDraft = (await studio.getConfig()).hiddenModules;
+  hiddenDraft.push("rig");
+  check("回传的数组是副本（界面改草稿不会写花宿主缓存）", JSON.stringify((await studio.getConfig()).hiddenModules) === JSON.stringify(["sprite", "tile"]));
+  await studio.saveConfig({ hiddenModules: [] });
+  check("可以全部恢复成可见", JSON.stringify((await studio.getConfig()).hiddenModules) === JSON.stringify([]));
+
+  // ── 2b. 优云智算版 H3 是模型下拉里的独立选项（不由 Base URL 推断）─────
+  const compshareId = initial.minimaxCompshareModelId;
+  check("配置视图给出优云智算版模型 id", compshareId === "MiniMax-H3 优云智算", String(compshareId));
+  check(
+    "模型下拉里包含优云智算版选项",
+    Array.isArray(initial.minimaxModels) && initial.minimaxModels.some((model) => model.id === compshareId),
+    JSON.stringify((initial.minimaxModels ?? []).map((model) => model.id))
+  );
+  check(
+    "官方主机预设不再混入优云智算网关",
+    Array.isArray(initial.minimaxHosts) && initial.minimaxHosts.every((host) => host.id !== "https://cp.compshare.cn"),
+    JSON.stringify((initial.minimaxHosts ?? []).map((host) => host.id))
+  );
+  check("默认模型（官方 H3）无 /minimax 前缀", initial.minimaxPathPrefix === "");
+  check("默认 H3 能力仍是官方档位", initial.minimaxCapabilities?.resolutions?.join(",") === "2K,768P");
+
+  const cpSaved = await studio.saveConfig({ minimaxModel: compshareId });
+  check("选中优云智算版后路径前缀为 /minimax", cpSaved.minimaxPathPrefix === "/minimax", cpSaved.minimaxPathPrefix);
+  check(
+    "选中优云智算版后能力放宽到 1080P/4~30",
+    cpSaved.minimaxCapabilities?.resolutions?.join(",") === "2K,1080P,768P" && cpSaved.minimaxCapabilities?.durationMax === 30,
+    JSON.stringify(cpSaved.minimaxCapabilities)
+  );
+  check("选中优云智算版后视图里的 Base URL 就是它的网关", cpSaved.minimaxBaseUrl === "https://cp.compshare.cn", cpSaved.minimaxBaseUrl);
+  check("优云智算版仍按 v2 协议", cpSaved.minimaxCapabilities?.protocol === "v2");
+
+  const cpBack = await studio.saveConfig({ minimaxModel: "MiniMax-H3", minimaxBaseUrl: "https://api.minimaxi.com" });
+  check("切回官方 H3 后前缀还原为空", cpBack.minimaxPathPrefix === "");
+  check("切回官方 H3 后档位还原", cpBack.minimaxCapabilities?.resolutions?.join(",") === "2K,768P");
+
+  const saved = await studio.saveConfig({ arkApiKey: "test-ark-key-1234", cellWidth: 300 });
+  check("保存后标记为已配置", saved.arkApiKeySet === true);
+  check("Key 只回传尾号提示", saved.arkApiKeyHint === "…1234", saved.arkApiKeyHint);
+  check("返回体里没有明文 Key", JSON.stringify(saved).includes("test-ark-key-1234") === false);
+  check("尺寸改动已生效", saved.cellWidth === 300);
+
+  const clamped = await studio.saveConfig({ keyHigh: 3, keyLow: 200, frameCount: 999, concurrency: 99 });
+  check("keyHigh 被夹到 keyLow 之上", clamped.keyHigh > clamped.keyLow, `${clamped.keyLow} < ${clamped.keyHigh}`);
+  check("frameCount 被夹到上限 64", clamped.frameCount === 64, String(clamped.frameCount));
+  check("concurrency 被夹到上限 8", clamped.concurrency === 8, String(clamped.concurrency));
+
+  // 行序迁移只做一次：没有版本号的旧配置才迁移，之后显式设置一律尊重。
+  // loadConfig 有进程内缓存，走 API 测不出来，所以直接测纯函数。
+  const { normalizeConfig, ROW_ORDER_VERSION } = await import("../lib/config.js");
+  const LEGACY_ORDER = ["front", "back", "downLeft", "downRight", "upLeft", "upRight", "left", "right"];
+  const migratedConfig = normalizeConfig({ rowOrder: LEGACY_ORDER });
+  check(
+    "无版本号 + 旧行序 → 迁移为罗盘顺时针",
+    migratedConfig.rowOrder[0] === "back" && migratedConfig.rowOrderVersion === ROW_ORDER_VERSION,
+    migratedConfig.rowOrder.join(",")
+  );
+  const explicitConfig = normalizeConfig({ rowOrder: LEGACY_ORDER, rowOrderVersion: ROW_ORDER_VERSION });
+  check(
+    "已有版本号时显式设置的行序被尊重（迁移只做一次）",
+    JSON.stringify(explicitConfig.rowOrder) === JSON.stringify(LEGACY_ORDER),
+    explicitConfig.rowOrder.join(",")
+  );
+  const customConfig = normalizeConfig({ rowOrder: ["front", "back"], rowOrderVersion: ROW_ORDER_VERSION });
+  check("任意自定义行序都不被改写", JSON.stringify(customConfig.rowOrder) === JSON.stringify(["front", "back"]));
+
+  const kept = await studio.saveConfig({ arkModel: "doubao-seedream-4-5-251128" });
+  check("不带 Key 的保存不会清空 Key", kept.arkApiKeySet === true);
+  const cleared = await studio.saveConfig({ clearArkApiKey: true });
+  check("clearArkApiKey 能清空 Key", cleared.arkApiKeySet === false);
+
+  // ── 2c. 生图后端：ark / custom 两条路走真实网关 ───────────────────────
+  // 只在这里验「配置能不能存进去、能不能读出来、脱敏对不对、阻塞判断是不是宿主算的」；
+  // 三种协议本身的请求细节由 scripts/verify-custom-image.mjs 打本地假服务端覆盖。
+  check("默认生图后端是火山方舟", initial.imageProvider === "ark", String(initial.imageProvider));
+  check("配置视图给出三种自定义协议", Array.isArray(initial.customProtocols) && initial.customProtocols.map((entry) => entry.id).join(",") === "openai,comfyui,sdwebui", JSON.stringify((initial.customProtocols ?? []).map((entry) => entry.id)));
+  check("每个协议都带默认地址与端点说明", (initial.customProtocols ?? []).every((entry) => typeof entry.baseUrl === "string" && entry.baseUrl !== "" && typeof entry.hint === "string" && entry.hint !== ""));
+  // 「当前后端」与「自定义那一组」是**两份**阻塞：前者决定能不能开跑，
+  // 后者决定自定义那一组的「测试连接」按钮能不能点 —— 两组互不牵连，
+  // 否则没配火山方舟 Key 的用户连自己的本地服务都测不了。
+  check("默认按火山方舟判定当前后端（没有 Key 就拦）", /火山方舟 API Key/.test(String(initial.imageProviderBlocker)), String(initial.imageProviderBlocker));
+  check("默认的自定义那一组是齐的（有默认地址与模型名）", initial.customImageBlocker === null, String(initial.customImageBlocker));
+  check("摘要写明当前生效的后端", typeof initial.imageProviderSummary === "string" && initial.imageProviderSummary.includes("火山方舟"), String(initial.imageProviderSummary));
+
+  const customSaved = await studio.saveConfig({
+    imageProvider: "custom",
+    customProtocol: "comfyui",
+    customBaseUrl: "http://127.0.0.1:8188",
+    customApiKey: "local-secret-9",
+    customModel: "sdxl.safetensors",
+    customWorkflow: '{"1":{"class_type":"KSampler","inputs":{"seed":"{{seed}}"}}}'
+  });
+  check("保存后当前后端是自定义", customSaved.imageProvider === "custom");
+  check("自定义 Key 只回传尾号提示", customSaved.customApiKeyHint === "…et-9", customSaved.customApiKeyHint);
+  check("返回体里没有自定义 Key 明文", JSON.stringify(customSaved).includes("local-secret-9") === false);
+  check("配好之后宿主判定可以开跑", customSaved.imageProviderBlocker === null, String(customSaved.imageProviderBlocker));
+  check(
+    "选了自定义后端后，缺火山方舟 Key 不再阻塞（两套配置互不牵连）",
+    customSaved.arkApiKeySet === false && customSaved.imageProviderBlocker === null
+  );
+  check("摘要带上协议与地址", customSaved.imageProviderSummary.includes("ComfyUI API") && customSaved.imageProviderSummary.includes("127.0.0.1:8188"), customSaved.imageProviderSummary);
+  await studio.saveConfig({ customWorkflow: "" });
+  check(
+    "ComfyUI 没填工作流时宿主给出阻塞说明（界面与工具面共用同一份判断）",
+    /工作流 JSON/.test(String((await studio.getConfig()).imageProviderBlocker)),
+    String((await studio.getConfig()).imageProviderBlocker)
+  );
+  const backToArk = await studio.saveConfig({ imageProvider: "ark", customWorkflow: "", customApiKey: "" });
+  check("切回火山方舟后阻塞回到 Key 那一句", /火山方舟 API Key/.test(String(backToArk.imageProviderBlocker)), String(backToArk.imageProviderBlocker));
+  check("清空自定义 Key 生效", backToArk.customApiKeySet === false);
+
+  // ── 3. 项目 CRUD ──────────────────────────────────────────────────────
+  console.log("3) 项目增删改查");
+  const created = await studio.createProject({ name: "冒烟测试角色" });
+  const projectId = created.projectId;
+  check("项目 id 形如 p…", /^p[a-z0-9]+$/.test(projectId), projectId);
+
+  const listed = await studio.listProjects();
+  check("项目列表包含新项目", listed.projects.some((p) => p.id === projectId));
+
+  let project = await studio.getProject({ projectId });
+  check("新项目 8 个方向都是 empty", Object.values(project.images).every((n) => n.status === "empty"));
+  check("assetBase 指向资源路由", project.assetBase.endsWith(`/${projectId}/`), project.assetBase);
+  check("每个方向都有默认提示词", Object.values(project.prompts.images).every((t) => typeof t === "string" && t.length > 40));
+  check("正面提示词已展开方位与可见部位", /向正南行走/.test(project.prompts.images.front) && /完整正脸/.test(project.prompts.images.front));
+
+  await studio.renameProject({ projectId, name: "改名后的项目" });
+  project = await studio.getProject({ projectId });
+  check("重命名生效", project.name === "改名后的项目", project.name);
+
+  // ── 4. 源图上传 ────────────────────────────────────────────────────────
+  console.log("4) 源图上传");
+  const px = Buffer.alloc(24 * 24 * 4);
+  for (let i = 0; i < 24 * 24; i++) {
+    px[i * 4] = 200;
+    px[i * 4 + 1] = 60;
+    px[i * 4 + 2] = 60;
+    px[i * 4 + 3] = 255;
+  }
+  const png = encodePng(px, 24, 24);
+  const uploaded = await studio.uploadSource({ projectId, name: "hero.png", data: png.toString("base64") });
+  check("上传返回落盘路径", uploaded.file === "source/hero.png", uploaded.file);
+
+  await (async () => {
+    let threw = false;
+    try {
+      await studio.uploadSource({ projectId, name: "evil.png", data: Buffer.from("not an image").toString("base64") });
+    } catch {
+      threw = true;
+    }
+    check("拒绝非图片内容", threw);
+  })();
+
+  // ── 5. 提示词 / 参数 / 验收 ────────────────────────────────────────────
+  console.log("5) 提示词、参数与验收打标");
+  await studio.savePrompts({ projectId, images: { front: "自定义正面提示词" }, video: "自定义视频提示词" });
+  project = await studio.getProject({ projectId });
+  check("方向提示词已保存", project.prompts.images.front === "自定义正面提示词");
+  check("其它方向提示词未被覆盖", /向正北行走/.test(project.prompts.images.back) && /完全看不到脸/.test(project.prompts.images.back));
+  check("视频提示词已保存", project.prompts.video === "自定义视频提示词");
+
+  // ── 5b. 内置默认提示词跟随语言 ─────────────────────────────────────────
+  // 默认提示词会真的发给生图 / 视频模型，所以英文界面下必须是英文版；
+  // 但**用户改过的那些一个字都不能动**——判据是「逐字等于另一语言的默认值」。
+  console.log("5b) 内置默认提示词跟随语言切换");
+  {
+    const zhBack = project.prompts.images.back;
+    const zhTurn = project.prompts.turn;
+    check("默认提示词初始是中文", /向正北行走/.test(zhBack) && /固定机位/.test(zhTurn));
+
+    project = await studio.getProject({ projectId, lang: "en" });
+    check("切英文后未改过的方向提示词变英文", /walks due north/.test(project.prompts.images.back), project.prompts.images.back.slice(0, 40));
+    check("切英文后转圈提示词变英文", /\[Static camera\]/.test(project.prompts.turn), project.prompts.turn.slice(0, 30));
+    check("用户改过的方向提示词原样保留", project.prompts.images.front === "自定义正面提示词", project.prompts.images.front);
+    check("用户改过的视频提示词原样保留", project.prompts.video === "自定义视频提示词", project.prompts.video);
+    check("英文方向提示词仍带英文朝向段", /\[Facing\] The character walks due north/.test(project.prompts.images.back));
+    check("英文方向提示词不含中文", !/[\u4e00-\u9fff]/u.test(project.prompts.images.back));
+
+    project = await studio.getProject({ projectId, lang: "zh" });
+    check("切回中文后默认提示词还原", project.prompts.images.back === zhBack && project.prompts.turn === zhTurn);
+    check("切回中文后用户改动仍在", project.prompts.images.front === "自定义正面提示词");
+
+    // 「重置为默认」要重置成**当前语言**的默认值，否则英文界面点一下会掉出中文。
+    await studio.savePrompts({ projectId, lang: "en", resetImagesToDefault: true, resetVideoToDefault: true, resetTurnToDefault: true });
+    project = await studio.getProject({ projectId, lang: "en" });
+    check("英文下「重置为默认」得到英文模板", /\[Camera\]/.test(project.prompts.images.front) && /\[Static shot\]/.test(project.prompts.video));
+    check("英文下重置后八个方向都是英文", ["front", "back", "left", "right"].every((key) => !/[\u4e00-\u9fff]/u.test(project.prompts.images[key])));
+
+    await studio.savePrompts({ projectId, lang: "zh", resetImagesToDefault: true, resetTurnToDefault: true });
+    project = await studio.getProject({ projectId });
+    check("中文下「重置为默认」得到中文模板", /【机位】/.test(project.prompts.images.front));
+    check("不带 lang 时按中文处理（老客户端兼容）", /【机位】/.test(project.prompts.images.front));
+
+    // 每个方向单独覆盖的视频提示词同样只换「没改过」的。
+    await studio.getProject({ projectId, lang: "en" });
+    await studio.savePrompts({ projectId, lang: "en", videoPerDirection: { front: "自定义单方向视频" } });
+    project = await studio.getProject({ projectId, lang: "zh" });
+    check("单方向视频覆盖不受语言切换影响", project.prompts.videoPerDirection.front === "自定义单方向视频", JSON.stringify(project.prompts.videoPerDirection).slice(0, 60));
+  }
+
+  await studio.saveSettings({ projectId, settings: { cellWidth: 128, cellHeight: 192, frameCount: 6, despill: 0.9, rowOrder: ["back", "front"] } });
+  project = await studio.getProject({ projectId });
+  check("项目尺寸已保存", project.settings.cellWidth === 128 && project.settings.cellHeight === 192);
+  check("抽帧数已保存", project.settings.frameCount === 6);
+  check("行序已保存", JSON.stringify(project.settings.rowOrder) === JSON.stringify(["back", "front"]));
+
+  await studio.saveSettings({ projectId, settings: { rowOrder: ["不存在的方向"] } });
+  project = await studio.getProject({ projectId });
+  check("非法行序被丢弃并回落", project.settings.rowOrder.length > 0 && project.settings.rowOrder.every((k) => k !== "不存在的方向"));
+
+  await studio.saveSettings({ projectId, settings: { bgTolerance: 999, fillRatio: 5, workingLongEdge: 99999, pixelSize: 999 } });
+  project = await studio.getProject({ projectId });
+  check("bgTolerance 被夹到上限 160", project.settings.bgTolerance === 160, String(project.settings.bgTolerance));
+  check("pixelSize 被夹到上限 32", project.settings.pixelSize === 32, String(project.settings.pixelSize));
+  check("fillRatio 被夹到 1", project.settings.fillRatio === 1, String(project.settings.fillRatio));
+  check("workingLongEdge 被夹到 2048", project.settings.workingLongEdge === 2048, String(project.settings.workingLongEdge));
+
+  await studio.setApproved({ projectId, stage: "sheet", approved: true });
+  project = await studio.getProject({ projectId });
+  check("整图验收打标生效", project.sheet.approved === true);
+
+  // 审核模式：固定流程里必须先问用户，选完存在目标自己身上，界面与会话读同一份。
+  const expectReject = async (name, fn, needle) => {
+    try {
+      await fn();
+      check(name, false, "预期抛错但没有");
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      check(name, message.includes(needle), message.slice(0, 80));
+    }
+  };
+  await studio.setReviewMode({ module: "sprite", id: projectId, reviewMode: "manual" });
+  project = await studio.getProject({ projectId });
+  check("审核模式记在项目上", project.reviewMode === "manual", String(project.reviewMode));
+  await studio.setReviewMode({ module: "sprite", id: projectId, reviewMode: "auto" });
+  project = await studio.getProject({ projectId });
+  check("审核模式可改选", project.reviewMode === "auto", String(project.reviewMode));
+  await expectReject("审核模式取值必须是 auto/manual", () => studio.setReviewMode({ module: "sprite", id: projectId, reviewMode: "sometimes" }), "未知审核模式");
+  await expectReject("审核模式必须指名模块", () => studio.setReviewMode({ module: "nope", id: projectId, reviewMode: "auto" }), "未知模块");
+
+  // 浏览器半区上报 origin：宿主据此拼出模型贴给用户的深链接。
+  const originOk = await studio.reportClientOrigin({ origin: "http://127.0.0.1:43120" });
+  check("接受 http origin 上报", originOk.ok === true && originOk.origin === "http://127.0.0.1:43120", JSON.stringify(originOk));
+  // DSH 0.2.1 `--public-url` 的路径前缀：宿主据此拼回链与 assetBase。
+  const prefixed = await studio.reportClientOrigin({ origin: "https://game.example", path: "/prefix/" });
+  check("接受带路径前缀的 origin 上报", prefixed.ok === true && prefixed.path === "/prefix/", JSON.stringify(prefixed));
+  const prefixedProject = await studio.getProject({ projectId });
+  check("带前缀时 assetBase 补上前缀", prefixedProject.assetBase === "/prefix/dsh-game-material-master/assets/" + projectId + "/", prefixedProject.assetBase);
+  const originBad = await studio.reportClientOrigin({ origin: "file:///etc/passwd" });
+  check("拒绝非 http(s) origin", originBad.ok === false, JSON.stringify(originBad));
+  // 后面的断言按本地根路径继续。
+  await studio.reportClientOrigin({ origin: "http://127.0.0.1:43120", path: "/" });
+
+  // ── 6. 阶段前置校验 ────────────────────────────────────────────────────
+  console.log("6) 前置校验（缺素材时给出可读错误）");
+  const expectThrow = async (name, fn, needle) => {
+    try {
+      await fn();
+      check(name, false, "预期抛错但没有");
+    } catch (error) {
+      const message = String(error?.message ?? error);
+      check(name, message.includes(needle), message.slice(0, 80));
+    }
+  };
+  await expectThrow("无绿幕图时拒绝生成视频", () => studio.runVideos({ projectId }), "绿幕图");
+  await expectThrow("无视频时拒绝抽帧", () => studio.runFrames({ projectId }), "视频");
+  await expectThrow("无抽帧时拒绝合成", () => studio.compose({ projectId }), "序列帧");
+  await expectThrow("无抽帧时拒绝重抠像", () => studio.rekey({ projectId }), "序列帧");
+  await expectThrow("未知方向不启动", () => studio.runImage({ projectId, key: "nope" }), "未知方向");
+  await expectThrow("未知项目直接报错", () => studio.getProject({ projectId: "p000000000000" }), "项目不存在");
+
+  // ── 7. 异步任务与错误传播 ──────────────────────────────────────────────
+  console.log("7) 异步任务与错误传播（用无效 Key 真实打一次方舟接口）");
+  await studio.saveConfig({ arkApiKey: "invalid-key-for-verification" });
+  const kicked = await studio.runImage({ projectId, key: "front" });
+  check("生图任务被接受", kicked.started === true, JSON.stringify(kicked));
+
+  let settled = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getProject({ projectId });
+    // 节点状态是任务体自己写的，运行表要等 kick 的 finally 才清空——两者之间
+    // 有一个很短的窗口，等到「收敛 + 运行表为空」才算这次任务真的结束。
+    if (
+      (snapshot.images.front.status === "error" || snapshot.images.front.status === "ready") &&
+      (snapshot.jobs ?? []).length === 0
+    ) {
+      settled = snapshot;
+      break;
+    }
+  }
+  check("任务在合理时间内收敛", settled !== null);
+  if (settled !== null) {
+    check("无效 Key 导致节点进入 error", settled.images.front.status === "error", settled.images.front.status);
+    check("错误信息可读且带原因", typeof settled.images.front.error === "string" && settled.images.front.error.length > 10, settled.images.front.error?.slice(0, 90));
+    check("任务结束后运行表清空", (settled.jobs ?? []).length === 0, JSON.stringify(settled.jobs));
+    check("失败被写入运行日志", settled.log.some((e) => e.level === "error"));
+  }
+
+  // 批量生图也要公布覆盖面：这一批可能跑好几分钟，界面靠它把还没轮到的方向
+  // 一直盖住（本地 pending 表只活 700ms）。还是那把无效 Key，八个方向都会很快
+  // 失败，但「这一批要重做哪几个方向」当场就能从运行表里读到。
+  const batchKick = await studio.runImages({ projectId });
+  check("批量生图任务被接受", batchKick.started === true, JSON.stringify(batchKick));
+  const batchProject = await studio.getProject({ projectId });
+  const batchJob = (batchProject.jobs ?? []).find((job) => job.key === "images:all");
+  check("批量生图公布了覆盖面", Array.isArray(batchJob?.targets) && batchJob.targets.length > 0, JSON.stringify(batchJob));
+  check(
+    "覆盖面按依赖层列出这一批要做的方向",
+    JSON.stringify(batchJob?.targets) === JSON.stringify(["front", "back", "downLeft", "downRight", "upLeft", "upRight", "left", "right"]),
+    JSON.stringify(batchJob?.targets)
+  );
+  // 让它落定再往下走：八个方向都要打一次接口（失败也是几秒内的事），
+  // 不等就会和后面对运行表的断言打架。
+  for (let i = 0; i < 60; i++) {
+    await sleep(500);
+    if (((await studio.getProject({ projectId })).jobs ?? []).length === 0) break;
+  }
+  const batchSettled = await studio.getProject({ projectId });
+  check("批量生图任务结束后运行表清空", (batchSettled.jobs ?? []).length === 0, JSON.stringify(batchSettled.jobs));
+
+  // ── 8. 静态资源路由 ────────────────────────────────────────────────────
+  console.log("8) 静态资源路由（真实 HTTP）");
+  const handler = captured.routes[0].handler;
+  const server = createServer((req, res) => {
+    void handler(req, res);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = server.address().port;
+  const base = `http://127.0.0.1:${port}/dsh-game-material-master/assets`;
+
+  try {
+    const okRes = await fetch(`${base}/${projectId}/source/hero.png`);
+    check("GET 已存在的图片返回 200", okRes.status === 200, String(okRes.status));
+    check("Content-Type 为 image/png", okRes.headers.get("content-type") === "image/png", okRes.headers.get("content-type"));
+    check("声明支持 Range", okRes.headers.get("accept-ranges") === "bytes");
+    check("提供 ETag", (okRes.headers.get("etag") ?? "").length > 4);
+    const body = Buffer.from(await okRes.arrayBuffer());
+    check("返回字节数与源文件一致", body.length === png.length, `${body.length} vs ${png.length}`);
+
+    const etag = okRes.headers.get("etag");
+    const cached = await fetch(`${base}/${projectId}/source/hero.png`, { headers: { "if-none-match": etag } });
+    check("ETag 命中返回 304", cached.status === 304, String(cached.status));
+
+    const ranged = await fetch(`${base}/${projectId}/source/hero.png`, { headers: { range: "bytes=0-9" } });
+    check("Range 请求返回 206", ranged.status === 206, String(ranged.status));
+    check("Content-Range 正确", ranged.headers.get("content-range") === `bytes 0-9/${png.length}`, ranged.headers.get("content-range"));
+    check("Range 返回 10 字节", Buffer.from(await ranged.arrayBuffer()).length === 10);
+
+    const missingRes = await fetch(`${base}/${projectId}/source/nope.png`);
+    check("不存在的文件返回 404", missingRes.status === 404, String(missingRes.status));
+
+    const outside = await fetch(`${base}/${projectId}/source/../../../../etc/hosts`);
+    check("目录穿越被挡住", outside.status === 400 || outside.status === 403 || outside.status === 404, String(outside.status));
+
+    const forbidden = await fetch(`${base}/${projectId}/../project.json`);
+    check("非白名单子目录被拒绝", forbidden.status === 400 || forbidden.status === 403 || forbidden.status === 404, String(forbidden.status));
+
+    const badId = await fetch(`${base}/../../../etc/hosts`);
+    check("非法项目 id 被拒绝", badId.status === 400 || badId.status === 404, String(badId.status));
+
+    // 转圈截帧的候选帧与缩略条带同样走这条路由：白名单漏了 `turn/` 时，
+    // 轴上的八个圆圈会对着一条 403 的条带拖——界面只表现为「图裂了」，
+    // 不报任何错，所以这里必须真的取一次。
+    const { writeFile: writeProbe } = await import("node:fs/promises");
+    const { join: joinProbe } = await import("node:path");
+    await writeProbe(joinProbe(HOME, "game-material-master", "projects", projectId, "turn", "probe.png"), png);
+    const turnRes = await fetch(`${base}/${projectId}/turn/probe.png`);
+    check("转圈产物目录可访问（白名单含 turn/）", turnRes.status === 200, String(turnRes.status));
+    const nestedRes = await fetch(`${base}/${projectId}/turn/frames/probe.png`);
+    check(
+      "转圈候选帧的子目录也放行（只是文件不存在）",
+      nestedRes.status === 404,
+      `白名单要放行、文件不存在才是 404，实际 ${nestedRes.status}`
+    );
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+
+  // ── 9. 抽帧与合成（本地合成视频，不调任何 API）─────────────────────────
+  // 这一段专门覆盖 startExtract / bakeSheet 的文件落盘路径：目录建漏、
+  // 路径拼错这类问题只有真跑一次才会暴露。
+  console.log("9) 抽帧与合成（本地合成绿幕视频）");
+  const { patchProject } = await import("../lib/store.js");
+  const { spawn } = await import("node:child_process");
+  const { readFile, writeFile } = await import("node:fs/promises");
+  const { join } = await import("node:path");
+  const projectRoot = join(HOME, "game-material-master", "projects", projectId);
+
+  function ffmpeg(args) {
+    return new Promise((resolve, reject) => {
+      const child = spawn("ffmpeg", args, { stdio: ["ignore", "ignore", "pipe"] });
+      let err = "";
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-300)))));
+      child.on("error", reject);
+    });
+  }
+
+  // 小尺寸 + 少帧数，让测试跑得快；只给两个方向造视频，其余留空。
+  await studio.saveSettings({
+    projectId,
+    settings: {
+      cellWidth: 32,
+      cellHeight: 32,
+      frameCount: 4,
+      fitMode: "contain",
+      pixelSize: 2,
+      autoCrop: true,
+      fillRatio: 0.9,
+      bottomMargin: 1,
+      bgTolerance: 40,
+      cropInset: 0,
+      concurrency: 2,
+      rowOrder: ["front", "back", "downLeft", "downRight", "upLeft", "upRight", "left", "right"]
+    }
+  });
+  const seeded = ["front", "back"];
+  for (const key of seeded) {
+    await ffmpeg([
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "color=c=0x00c040:s=160x160:d=2:r=12",
+      "-f", "lavfi", "-i", "color=c=0xff8800:s=36x70:d=2:r=12",
+      "-filter_complex", `[0][1]overlay=x='30+50*sin(2*PI*t)':y='45'`,
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast",
+      join(projectRoot, "videos", `${key}.mp4`)
+    ]);
+  }
+  await patchProject(projectId, (project) => {
+    for (const key of seeded) {
+      project.videos[key] = { status: "ready", file: `videos/${key}.mp4`, approved: false };
+    }
+  });
+
+  const extractKick = await studio.runFrames({ projectId });
+  check("抽帧任务被接受", extractKick.started === true, JSON.stringify(extractKick));
+  // 任务一登记就要公布覆盖面：界面靠它盖住「还没轮到」的方向。抽帧是
+  // kick 型调用（立刻返回，后台一次两个方向慢慢做），浏览器半区那张本地
+  // pending 表只多留 700ms，盖不住剩下的六个——不公布就会先转圈、再退回
+  // 「尚未抽帧」，过一阵才出结果（实测 bug）。
+  const justKicked = await studio.getProject({ projectId });
+  const extractJob = (justKicked.jobs ?? []).find((job) => job.key === "frames:extract");
+  check("抽帧任务公布了覆盖面", extractJob !== undefined, JSON.stringify(justKicked.jobs));
+  check(
+    "覆盖面正好是「有视频的方向」",
+    JSON.stringify(extractJob?.targets) === JSON.stringify(seeded),
+    JSON.stringify(extractJob?.targets)
+  );
+  check(
+    "没视频的方向不在覆盖面里（否则它会一直转圈）",
+    (extractJob?.targets ?? []).includes("left") === false,
+    JSON.stringify(extractJob?.targets)
+  );
+
+  let framesSettled = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getProject({ projectId });
+    // 抽帧把节点标成 ready 之后还会接着抠像、写预览带，最后才合成整图，
+    // 所以「没有 running」只是中间态：必须等到抠像帧已经写完再判收敛，
+    // 否则后续断言会在中间态上闪失败（实测在机器有负载时必现）。
+    const keyedReady = seeded.every(
+      (key) => snapshot.frames[key]?.frames?.length > 0 && snapshot.frames[key]?.keyed?.length === snapshot.frames[key]?.frames?.length
+    );
+    if (
+      keyedReady &&
+      Object.values(snapshot.frames).every((node) => node.status !== "running") &&
+      (snapshot.sheet.status === "ready" || snapshot.sheet.status === "error")
+    ) {
+      framesSettled = snapshot;
+      break;
+    }
+  }
+  check("抽帧在合理时间内收敛", framesSettled !== null);
+  if (framesSettled !== null) {
+    for (const key of seeded) {
+      const node = framesSettled.frames[key];
+      check(`${key} 抽到 4 帧`, node?.status === "ready" && node.frames.length === 4, `${node?.status} ${node?.frames?.length} 帧 ${node?.error ?? ""}`);
+      check(`${key} 写出了抠像帧`, Array.isArray(node?.keyed) && node.keyed.length === 4, String(node?.keyed?.length));
+      check(`${key} 写出了预览带`, typeof node?.strip === "string", node?.strip ?? "(无)");
+      check(`${key} 缓存了 raw.bin`, typeof node?.raw === "string", node?.raw ?? "(无)");
+    }
+    // 未提供视频的方向必须保持 empty，不能被误判成失败。
+    check("没有视频的方向保持未抽帧", framesSettled.frames.left.status === "empty", framesSettled.frames.left.status);
+
+    // 抽帧抽到的是「工作尺寸」而不是格子尺寸；测试视频 160x160，长边上限默认 768，所以原样保留。
+    check("记录了 raw 的工作尺寸", framesSettled.frames.front.rawWidth === 160 && framesSettled.frames.front.rawHeight === 160,
+      `${framesSettled.frames.front.rawWidth}x${framesSettled.frames.front.rawHeight}`);
+    // 落盘物必须真的存在且尺寸正确（用 PNG 头解析宽高）。
+    const firstPng = join(projectRoot, framesSettled.frames.front.frames[0]);
+    const png = await readFile(firstPng);
+    const pngWidth = png.readUInt32BE(16);
+    const pngHeight = png.readUInt32BE(20);
+    check("抽出的帧是合法 PNG 且尺寸等于工作尺寸", pngWidth === 160 && pngHeight === 160, `${pngWidth}x${pngHeight}`);
+  }
+
+  // 单方向抽帧只该覆盖那一个方向：覆盖面写成全量的话，其余方向会被白白盖住，
+  // 而它们根本不会在这次任务里重跑（界面上表现为七个格子一直转圈）。
+  const singleKick = await studio.runFrames({ projectId, keys: ["back"] });
+  check("单方向抽帧任务被接受", singleKick.started === true, JSON.stringify(singleKick));
+  const singleJob = (await studio.getProject({ projectId })).jobs?.find((job) => job.key === "frames:extract");
+  check(
+    "单方向抽帧只覆盖那一个方向",
+    JSON.stringify(singleJob?.targets) === JSON.stringify(["back"]),
+    JSON.stringify(singleJob?.targets)
+  );
+  // 等它跑完再往下走：后面的合成与它写的是同一批文件，不能叠在一起。
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    if (((await studio.getProject({ projectId })).jobs ?? []).length === 0) break;
+  }
+
+  // 手动选帧：每个方向自己抽候选帧、拖圆圈决定输出帧。必须放在合成之前，
+  // 后面的转圈截帧会清掉行走视频。输出帧数仍跟 settings.frameCount（这里是 4）。
+  await expectThrow("手动选帧拒绝未知方向", () => studio.prepareFramePick({ projectId, key: "nope" }), "未知方向");
+  await expectThrow("没视频的方向不能手动选帧", () => studio.prepareFramePick({ projectId, key: "left" }), "视频");
+  const pickKick = await studio.prepareFramePick({ projectId, key: "front", count: 8 });
+  check("手动选帧任务被接受", pickKick.started === true, JSON.stringify(pickKick));
+  let picked = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getProject({ projectId });
+    const node = snapshot.frames.front;
+    const jobGone = (snapshot.jobs ?? []).every((job) => job.key !== "frames:pick:front");
+    if (jobGone && node?.candidates?.frames?.length === 8 && node.status === "ready" && node.frames?.length === 4) {
+      picked = snapshot;
+      break;
+    }
+  }
+  check(
+    "手动选帧抽出 8 张候选、仍输出 4 帧",
+    picked !== null,
+    picked === null ? "超时" : `${picked.frames.front.status} 候选 ${picked.frames.front.candidates?.frames?.length} 输出 ${picked.frames.front.frames?.length}`
+  );
+  check("默认圆圈个数等于抽帧数", picked?.frames.front.candidates?.picks?.length === 4, JSON.stringify(picked?.frames.front.candidates?.picks));
+  const beforePick = createHash("md5").update(await readFile(join(projectRoot, "frames/front/f00.png"))).digest("hex");
+  const moved = await studio.setFramePick({ projectId, key: "front", slot: 0, index: 7 });
+  check("拖动第 1 个圆圈改到候选第 8 格", moved.changed === true && moved.index === 7 && moved.picks?.[0] === 7, JSON.stringify(moved));
+  const afterPick = createHash("md5").update(await readFile(join(projectRoot, "frames/front/f00.png"))).digest("hex");
+  check("改位置后这一张输出帧变了", beforePick !== afterPick);
+  const others = await studio.getProject({ projectId });
+  check(
+    "其它方向不受这次手动选帧影响",
+    others.frames.back?.frames?.length === 4 && others.frames.back?.candidates === undefined,
+    `back ${others.frames.back?.frames?.length} 帧 candidates=${others.frames.back?.candidates === undefined ? "无" : "有"}`
+  );
+  const written = await studio.setFramePicks({ projectId, key: "front", picks: [1, 3, 5, 7] });
+  check("一次写回四个位置", JSON.stringify(written.picks) === JSON.stringify([1, 3, 5, 7]), JSON.stringify(written.picks));
+  const reset = await studio.resetFramePicks({ projectId, key: "front" });
+  check("重置后回到等分", Array.isArray(reset.picks) && reset.picks.length === 4 && reset.picks[0] !== 7, JSON.stringify(reset.picks));
+
+  const composeKick = await studio.compose({ projectId });
+  check("合成任务被接受", composeKick.started === true, JSON.stringify(composeKick));
+  let sheetSettled = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getProject({ projectId });
+    if (snapshot.sheet.status !== "running") {
+      sheetSettled = snapshot;
+      break;
+    }
+  }
+  check("合成在合理时间内完成", sheetSettled?.sheet.status === "ready", `${sheetSettled?.sheet.status} ${sheetSettled?.sheet.error ?? ""}`);
+  check("整图尺寸 = 4 列 × 8 行 × 32px", sheetSettled?.sheet.width === 128 && sheetSettled?.sheet.height === 256, `${sheetSettled?.sheet.width}x${sheetSettled?.sheet.height}`);
+  if (sheetSettled?.sheet.file !== undefined) {
+    const sheetPng = await readFile(join(projectRoot, sheetSettled.sheet.file));
+    check("整图落盘且是合法 PNG", sheetPng.readUInt32BE(16) === 128 && sheetPng.readUInt32BE(20) === 256);
+  }
+
+  const rekeyKick = await studio.rekey({ projectId });
+  check("重跑抠像被接受", rekeyKick.started === true, JSON.stringify(rekeyKick));
+  let rekeySettled = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getProject({ projectId });
+    if (snapshot.sheet.status !== "running") {
+      rekeySettled = snapshot;
+      break;
+    }
+  }
+  check("重跑抠像后整图仍可用", rekeySettled?.sheet.status === "ready", `${rekeySettled?.sheet.status} ${rekeySettled?.sheet.error ?? ""}`);
+
+  // ── 整图必须记录「实际是怎么切的」──────────────────────────────────────
+  // 这是行走预览取错方向那个 bug 的根因：整图按旧行序生成，而消费者按新
+  // settings 的行号去切，于是「向北走」切到了第 0 行 = 正面。
+  const composedOrder = (await studio.getProject({ projectId })).settings.rowOrder;
+  check(
+    "整图记录了生成时实际使用的行序",
+    JSON.stringify(rekeySettled?.sheet.rowOrder) === JSON.stringify(composedOrder),
+    `${JSON.stringify(rekeySettled?.sheet.rowOrder)} vs ${JSON.stringify(composedOrder)}`
+  );
+  check(
+    "整图记录了格子尺寸与帧数",
+    rekeySettled?.sheet.cellWidth === 32 && rekeySettled?.sheet.cellHeight === 32 && rekeySettled?.sheet.frameCount === 4,
+    `${rekeySettled?.sheet.cellWidth}x${rekeySettled?.sheet.cellHeight} @${rekeySettled?.sheet.frameCount}`
+  );
+
+  // ── 改行序必须自动重新合成，不能让整图和设置对不上 ──────────────────────
+  const beforeSwitch = (await studio.getProject({ projectId })).sheet.generatedAt;
+  // 故意用一个和当前不同的顺序（当前是测试开头设的那串），否则测不出「变了」
+  const newOrder = ["front", "back", "left", "right", "downLeft", "downRight", "upLeft", "upRight"];
+  await studio.saveSettings({ projectId, settings: { rowOrder: newOrder } });
+  let reswapped = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getProject({ projectId });
+    if (snapshot.sheet.status === "ready" && snapshot.sheet.generatedAt > beforeSwitch) {
+      reswapped = snapshot;
+      break;
+    }
+  }
+  check("改行序后自动重新合成", reswapped !== null, reswapped === null ? "超时未重新合成" : "已重新合成");
+  check(
+    "重新合成后整图记录的行序同步更新",
+    JSON.stringify(reswapped?.sheet.rowOrder) === JSON.stringify(newOrder),
+    JSON.stringify(reswapped?.sheet.rowOrder)
+  );
+
+  // 改抠像参数同样应当触发重新合成（否则预览看到的是旧参数的结果）
+  const beforeKey = reswapped?.sheet.generatedAt ?? 0;
+  await studio.saveSettings({ projectId, settings: { keyLow: 40 } });
+  let rekeyed = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getProject({ projectId });
+    if (snapshot.sheet.status === "ready" && snapshot.sheet.generatedAt > beforeKey) {
+      rekeyed = snapshot;
+      break;
+    }
+  }
+  check("改抠像参数后自动重新合成", rekeyed !== null, rekeyed === null ? "超时未重新合成" : "已重新合成");
+
+  // 项目级也走同样的一次性迁移
+  await patchProject(projectId, (project) => {
+    project.settings.rowOrder = LEGACY_ORDER;
+    delete project.settings.rowOrderVersion;
+  });
+  const projectMigrated = await studio.getProject({ projectId });
+  check(
+    "项目级：无版本号 + 旧行序 → 迁移为罗盘顺时针",
+    projectMigrated.settings.rowOrder[0] === "back",
+    projectMigrated.settings.rowOrder.join(",")
+  );
+  await patchProject(projectId, (project) => {
+    project.settings.rowOrder = LEGACY_ORDER;
+  });
+  const projectHonored = await studio.getProject({ projectId });
+  check(
+    "项目级：迁移后显式设成同一顺序被尊重",
+    JSON.stringify(projectHonored.settings.rowOrder) === JSON.stringify(LEGACY_ORDER),
+    projectHonored.settings.rowOrder.join(",")
+  );
+
+  // 抽帧参数变了要标记 stale（必须重新抽帧，不能只重新合成）
+  const beforeExtract = (await studio.getProject({ projectId })).frames.front.stale === true;
+  await studio.saveSettings({ projectId, settings: { workingLongEdge: 320 } });
+  const afterExtract = await studio.getProject({ projectId });
+  check("改抽帧工作尺寸后标记为需重新抽帧", afterExtract.frames.front.stale === true && beforeExtract === false, String(afterExtract.frames.front.stale));
+
+  // ── 9b. 单方向「重新生成」视频 ─────────────────────────────────────────
+  // 实测 bug：点某个方向的「重新生成」，界面转一圈之后失败，日志里只有
+  // 「没有可提交的方向：请先生成绿幕图，或先清掉已完成的视频」。原因是宿主把
+  // ready 的方向一律当成「已提交」过滤掉，而客户端并没有先清空——于是这次点击
+  // 既没作废旧视频，也没真的提交新任务。
+  // 这里用本地假网关顶替 MiniMax：提交必然失败，但「有没有真的去提交」一目了然。
+  console.log("9b) 单方向重新生成视频（本地假网关，不联网）");
+  await writeFile(join(projectRoot, "images", "front.png"), png);
+  await patchProject(projectId, (project) => {
+    project.images.front = { status: "ready", file: "images/front.png", approved: true };
+  });
+
+  const fakeGateway = createServer((req, res) => {
+    req.resume();
+    res.writeHead(401, { "content-type": "application/json" });
+    res.end(JSON.stringify({ base_resp: { status_code: 1004, status_msg: "invalid api key (verify)" } }));
+  });
+  await new Promise((resolve) => fakeGateway.listen(0, "127.0.0.1", resolve));
+  const gatewayPort = fakeGateway.address().port;
+  await studio.saveConfig({
+    minimaxApiKey: "fake-key-for-verification",
+    minimaxBaseUrl: `http://127.0.0.1:${gatewayPort}`
+  });
+
+  try {
+    // 批量提交带 regenerate 会把八段视频全重跑一遍（真金白银），必须直接拒绝。
+    await expectThrow("批量带 regenerate 被拒绝", () => studio.runVideos({ projectId, regenerate: true }), "必须指定方向");
+
+    const regenKick = await studio.runVideos({ projectId, keys: ["front"], regenerate: true });
+    check("单方向重新生成被接受", regenKick.started === true, JSON.stringify(regenKick));
+
+    // 作废发生在 RPC 返回之前，所以这里可以直接断言，不需要等异步任务。
+    const afterKick = await studio.getProject({ projectId });
+    check(
+      "旧视频被作废（不再被当成已完成）",
+      afterKick.videos.front.status !== "ready" && afterKick.videos.front.file === undefined,
+      `${afterKick.videos.front.status} ${afterKick.videos.front.file ?? "(无文件)"}`
+    );
+    check(
+      "旧序列帧一并作废（否则整图会混进上一版动作的帧）",
+      afterKick.frames.front.status === "empty" && afterKick.frames.front.frames.length === 0 && afterKick.frames.front.raw === undefined,
+      `${afterKick.frames.front.status} / ${afterKick.frames.front.frames.length} 帧 / raw=${afterKick.frames.front.raw ?? "(无)"}`
+    );
+    check("整图一并作废", afterKick.sheet.status === "empty", afterKick.sheet.status);
+    // 只作废被点名的方向：别的方向的成片与帧不能跟着一起被清掉。
+    check(
+      "未点名的方向不受影响",
+      afterKick.videos.back.status === "ready" && afterKick.frames.back.status === "ready",
+      `${afterKick.videos.back.status} / ${afterKick.frames.back.status}`
+    );
+    check("作废动作写进了运行日志", afterKick.log.some((e) => /重新生成：已作废/.test(e.message)));
+
+    let regen = null;
+    for (let i = 0; i < 40; i++) {
+      await sleep(500);
+      const snapshot = await studio.getProject({ projectId });
+      // 提交前宿主会先写一条「提交「南 · 正对镜头」视频任务」的日志，
+      // 拿到它 + 节点收敛，才算这一次点击真的走到了远端。
+      const submitted = snapshot.log.some((e) => /提交「南 · 正对镜头」视频任务/.test(e.message));
+      const node = snapshot.videos.front;
+      if (submitted && (node.status === "error" || node.status === "ready")) {
+        regen = snapshot;
+        break;
+      }
+    }
+    // 关键回归：这一方向必须真的被重新提交出去。修复前它连提交都不会发生，
+    // 只有日志里那句「没有可提交的方向」。
+    check(
+      "真的重新提交了视频任务",
+      regen !== null,
+      regen === null ? "超时未收敛" : `${regen.videos.front.status} ${regen.videos.front.remoteStatus ?? ""}`
+    );
+    check(
+      "不再出现「没有可提交的方向」",
+      regen !== null && !regen.log.some((e) => e.message.includes("没有可提交的方向"))
+    );
+    check(
+      "假网关的 401 落到节点上（错误可读）",
+      regen?.videos.front.status === "error" && /提交视频任务失败/.test(regen?.videos.front.error ?? ""),
+      `${regen?.videos.front.status} ${regen?.videos.front.error ?? ""}`.slice(0, 110)
+    );
+
+    // 已经完成的方向默认不重复提交：不作废、也不重跑，而是直接给出可读原因，
+    // 而不是转一圈之后只在日志里留一句失败。
+    await patchProject(projectId, (project) => {
+      project.videos.front = { status: "ready", file: "videos/front.mp4", approved: false };
+      project.videos.back = { status: "ready", file: "videos/back.mp4", approved: false };
+    });
+    await expectThrow("已完成的方向默认不重跑，并给出可读原因", () => studio.runVideos({ projectId, keys: ["front"] }), "都已经生成完成");
+  } finally {
+    await new Promise((resolve) => fakeGateway.close(resolve));
+    await studio.saveConfig({ minimaxBaseUrl: "https://api.minimaxi.com", clearMinimaxApiKey: true });
+  }
+
+  // ── 9c. 阶段①的默认生成方式：转圈截帧 ─────────────────────────────────
+  //
+  // 与逐方向生图完全不同的链路：一段「原地匀速转一圈」的视频 → 匀抽候选帧 →
+  // 按八个截帧位置切出八张方向图。这里用本地合成的「转动」视频跑真实 ffmpeg，
+  // 不联网、不花钱，但把「位置改了要切出不同的帧」「下游要作废」全都测到。
+  console.log("9c) 转圈截帧（本地合成转圈视频，不调 API）");
+  {
+    const turnVideo = join(projectRoot, "videos", "turn.mp4");
+    // 一根竖条左右匀速扫动：不同时刻的画面不同，于是「不同截帧位置切出不同图」
+    // 可以被字节级断言（真实转圈视频当然也是每帧朝向不同）。
+    await ffmpeg([
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "color=c=0x00c040:s=160x160:d=2:r=12",
+      "-f", "lavfi", "-i", "color=c=0xff8800:s=24x90:d=2:r=12",
+      "-filter_complex", "[0][1]overlay=x='8+120*t/2':y='35'",
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast",
+      turnVideo
+    ]);
+    await patchProject(projectId, (project) => {
+      project.turn.video = { status: "ready", file: "videos/turn.mp4", approved: false, firstFrame: "source/hero.png" };
+    });
+
+    let turnState = await studio.getProject({ projectId });
+    check("新项目默认走转圈截帧", turnState.imageMode === "turn", String(turnState.imageMode));
+    check("转圈状态在项目里（视频 + 候选帧 + 八个位置）", turnState.turn?.frames?.picks?.front === 0, JSON.stringify(turnState.turn?.frames?.picks));
+
+    await expectThrow("没有转圈视频时拒绝抽候选帧", async () => {
+      await patchProject(projectId, (project) => {
+        project.turn.video = { status: "empty", approved: false };
+      });
+      return studio.runTurnFrames({ projectId });
+    }, "转圈视频");
+    await patchProject(projectId, (project) => {
+      project.turn.video = { status: "ready", file: "videos/turn.mp4", approved: false, firstFrame: "source/hero.png" };
+    });
+
+    const turnKick = await studio.runTurnFrames({ projectId, count: 16 });
+    check("抽转圈候选帧任务被接受", turnKick.started === true, JSON.stringify(turnKick));
+    const turnKicked = await studio.getProject({ projectId });
+    const turnJob = (turnKicked.jobs ?? []).find((job) => job.key === "turn:frames");
+    check("转圈抽帧任务公布了覆盖面", turnJob !== undefined, JSON.stringify(turnKicked.jobs));
+    check(
+      "覆盖面是八个方向（切完一个摘一个）",
+      Array.isArray(turnJob?.targets) && turnJob.targets.length === 8 && turnJob.targets.includes("front"),
+      JSON.stringify(turnJob?.targets)
+    );
+
+    let turnSettled = null;
+    for (let i = 0; i < 60; i++) {
+      await sleep(500);
+      const snapshot = await studio.getProject({ projectId });
+      const busy = (snapshot.jobs ?? []).some((job) => job.key === "turn:frames");
+      if (!busy && (snapshot.turn.frames.status === "ready" || snapshot.turn.frames.status === "error")) {
+        turnSettled = snapshot;
+        break;
+      }
+    }
+    check(
+      "候选帧抽取完成",
+      turnSettled?.turn.frames.status === "ready",
+      `${turnSettled?.turn.frames.status} ${turnSettled?.turn.frames.error ?? ""}`
+    );
+    check("候选帧张数 = 请求的 16", turnSettled?.turn.frames.rawFrameCount === 16, String(turnSettled?.turn.frames.rawFrameCount));
+    check("每张候选帧都有时间戳", turnSettled?.turn.frames.times.length === 16, String(turnSettled?.turn.frames.times.length));
+    check(
+      "时间戳按「第 i 帧 = i × 时长 / 张数」均匀分布",
+      Math.abs(turnSettled.turn.frames.times[1] - turnSettled.turn.frames.times[2] / 2) < 1e-6 &&
+        Math.abs(turnSettled.turn.frames.times[15] - (turnSettled.turn.frames.times[15] / 15) * 15) < 1e-6,
+      JSON.stringify(turnSettled?.turn.frames.times?.slice(0, 4))
+    );
+    // 默认转圈方向是 ccw（实测 MiniMax-H3 的转向），所以 45° 那一档先落在东南。
+    const expectedPicks = { front: 0, downRight: 2, right: 4, upRight: 6, back: 8, upLeft: 10, left: 12, downLeft: 14 };
+    check(
+      "八个位置按这次张数重新等分（不是按默认的 32 张算）",
+      Object.entries(expectedPicks).every(([key, value]) => turnSettled.turn.frames.picks[key] === value),
+      JSON.stringify(turnSettled.turn.frames.picks)
+    );
+    check(
+      "八个方向图都由截帧写出来",
+      Object.values(turnSettled.images).every((node) => node.status === "ready" && typeof node.file === "string"),
+      JSON.stringify(Object.fromEntries(Object.entries(turnSettled.images).map(([k, v]) => [k, v.status])))
+    );
+    check("候选帧条带落盘", turnSettled.turn.frames.strip === "turn/strip.png");
+    const stripBytes = await readFile(join(projectRoot, "turn", "strip.png"));
+    check("条带图非空", stripBytes.length > 100, `${stripBytes.length} 字节`);
+    check("抽帧完成写进日志", turnSettled.log.some((entry) => /候选帧抽取完成：16 张/.test(entry.message)));
+
+    // 不同朝向必须切到不同的帧——否则「八个圆圈」就是摆设。
+    const hashes = {};
+    for (const key of ["front", "back", "left", "right", "downLeft"]) {
+      hashes[key] = createHash("md5").update(await readFile(join(projectRoot, turnSettled.images[key].file))).digest("hex");
+    }
+    check("不同方向切到不同的帧", new Set(Object.values(hashes)).size === 5, Object.values(hashes).map((h) => h.slice(0, 6)).join(","));
+
+    // ── 拖动圆圈：只重切那一张，并把这一方向的下游作废 ────────────────────
+    await patchProject(projectId, (project) => {
+      project.videos.front = { status: "ready", file: "videos/front.mp4", approved: true };
+      project.frames.front = { status: "ready", frames: ["frames/front/f00.png"], keyed: [], approved: true, raw: "frames/front/raw.bin" };
+      project.sheet = { status: "ready", file: "out/sheet.png", approved: true };
+      project.images.front.approved = true;
+    });
+    const pickResult = await studio.setTurnPick({ projectId, key: "front", index: 5 });
+    check("拖动圆圈改位置成功", pickResult.changed === true && pickResult.index === 5, JSON.stringify(pickResult));
+    const afterPick = await studio.getProject({ projectId });
+    const frontHash = createHash("md5").update(await readFile(join(projectRoot, afterPick.images.front.file))).digest("hex");
+    check("正面图换成了新那一帧", frontHash !== hashes.front, `${frontHash.slice(0, 6)} vs ${hashes.front.slice(0, 6)}`);
+    check("只重切点名的方向（别的方向不动）", JSON.stringify(afterPick.turn.frames.picks.back) === "8", String(afterPick.turn.frames.picks.back));
+    check(
+      "这一方向的行走视频与序列帧被作废",
+      afterPick.videos.front.status === "empty" && afterPick.frames.front.status === "empty" && afterPick.frames.front.raw === undefined,
+      `${afterPick.videos.front.status} / ${afterPick.frames.front.status}`
+    );
+    check("整图被作废（避免混进旧朝向的帧）", afterPick.sheet.status === "empty", afterPick.sheet.status);
+    check("换过帧的方向要重新验收", afterPick.images.front.approved === false);
+    check(
+      "未点名的方向不受影响",
+      afterPick.videos.back.status === "ready" || afterPick.videos.back.status === "empty",
+      afterPick.videos.back.status
+    );
+
+    const noop = await studio.setTurnPick({ projectId, key: "front", index: 5 });
+    check("位置没变时不重复重切（也不作废下游）", noop.changed === false, JSON.stringify(noop));
+
+    const cutOne = await studio.cutTurnFrames({ projectId, keys: ["right"] });
+    check("可以只重切指定方向", cutOne.ok === true);
+
+    // 一次写多个位置（agent 看完整圈条带后整份写回）：只重切点名的方向，其余不动。
+    const bulk = await studio.setTurnPicks({ projectId, picks: { front: 1, downRight: 6 } });
+    check(
+      "可以一次写多个截帧位置",
+      bulk.picks.front === 1 && bulk.picks.downRight === 6 && bulk.picks.back === 8,
+      JSON.stringify(bulk.picks)
+    );
+    const afterBulk = await studio.getProject({ projectId });
+    check("整份写回只重切点名的方向", afterBulk.turn.frames.picks.front === 1 && afterBulk.videos.front.status === "empty");
+    await expectThrow("整份写回时未知方向被拒绝", () => studio.setTurnPicks({ projectId, picks: { nope: 1 } }), "未知方向");
+    await expectThrow("位置越界会被夹住（不是报错）", async () => {
+      const clamped = await studio.setTurnPick({ projectId, key: "front", index: 999 });
+      return clamped.index === 15 ? Promise.reject(new Error("__ok__")) : Promise.resolve(clamped);
+    }, "__ok__");
+    await expectThrow("未知方向拒绝", () => studio.setTurnPick({ projectId, key: "nope", index: 0 }), "未知方向");
+
+    // ── 转圈方向决定默认位置怎么排（顺时针/逆时针的左右斜向互换）────────────
+    await studio.resetTurnPicks({ projectId, direction: "ccw" });
+    const ccw = await studio.getProject({ projectId });
+    check(
+      "逆时针把东南/西南的位置互换",
+      ccw.turn.direction === "ccw" && ccw.turn.frames.picks.downLeft === 14 && ccw.turn.frames.picks.downRight === 2,
+      JSON.stringify(ccw.turn.frames.picks)
+    );
+    await studio.resetTurnPicks({ projectId, direction: "cw" });
+    const cw = await studio.getProject({ projectId });
+    check(
+      "顺时针换回来",
+      cw.turn.direction === "cw" && cw.turn.frames.picks.downLeft === 2 && cw.turn.frames.picks.downRight === 14,
+      JSON.stringify(cw.turn.frames.picks)
+    );
+
+    // ── 改候选帧数：位置按比例换算，而不是被压到最后一帧 ──────────────────
+    await studio.setTurnPick({ projectId, key: "front", index: 12 });
+    await studio.saveSettings({ projectId, settings: { turnFrameCount: 8 } });
+    let rescaled = null;
+    for (let i = 0; i < 60; i++) {
+      await sleep(500);
+      const snapshot = await studio.getProject({ projectId });
+      const busy = (snapshot.jobs ?? []).some((job) => job.key === "turn:frames");
+      if (!busy && snapshot.turn.frames.rawFrameCount === 8) {
+        rescaled = snapshot;
+        break;
+      }
+    }
+    check("改候选帧数后自动重抽", rescaled !== null, rescaled === null ? "超时未重抽" : "已重抽");
+    check("重抽后的张数生效", rescaled?.turn.frames.rawFrameCount === 8, String(rescaled?.turn.frames.rawFrameCount));
+    check(
+      "八个位置按比例换算（12/16 → 6/8）",
+      rescaled?.turn.frames.picks.front === 6,
+      JSON.stringify(rescaled?.turn.frames.picks)
+    );
+    check("工作尺寸类参数变化会把候选帧标成过期", (await studio.getProject({ projectId })).turn.frames.stale === false);
+
+    // ── 切换生成方式：产物一概不动 ────────────────────────────────────────
+    await studio.setImageMode({ projectId, mode: "direct" });
+    const switched = await studio.getProject({ projectId });
+    check("切到逐方向生图", switched.imageMode === "direct");
+    check("切换不删产物", Object.values(switched.images).every((node) => node.status === "ready"));
+    await expectThrow("未知生成方式被拒绝", () => studio.setImageMode({ projectId, mode: "nope" }), "未知生成方式");
+    await studio.setImageMode({ projectId, mode: "turn" });
+    check("切回转圈截帧", (await studio.getProject({ projectId })).imageMode === "turn");
+
+    // ── 转圈视频提交：错误要落到节点上（本地假网关，不联网）────────────────
+    const turnGateway = createServer((req, res) => {
+      req.resume();
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ base_resp: { status_code: 1004, status_msg: "invalid api key (verify)" } }));
+    });
+    await new Promise((resolve) => turnGateway.listen(0, "127.0.0.1", resolve));
+    await studio.saveConfig({
+      minimaxApiKey: "fake-key-for-verification",
+      minimaxBaseUrl: `http://127.0.0.1:${turnGateway.address().port}`
+    });
+    try {
+      const videoKick = await studio.runTurnVideo({ projectId });
+      check("转圈视频提交被接受", videoKick.started === true, JSON.stringify(videoKick));
+      let videoSettled = null;
+      for (let i = 0; i < 40; i++) {
+        await sleep(500);
+        const snapshot = await studio.getProject({ projectId });
+        if (snapshot.turn.video.status === "error" || snapshot.turn.video.status === "ready") {
+          videoSettled = snapshot;
+          break;
+        }
+      }
+      check(
+        "假网关的 401 落到转圈视频节点上",
+        videoSettled?.turn.video.status === "error" && /提交视频任务失败/.test(videoSettled?.turn.video.error ?? ""),
+        `${videoSettled?.turn.video.status} ${videoSettled?.turn.video.error ?? ""}`.slice(0, 110)
+      );
+      // 转圈模式的输入是「一张图」：必须记下模型实际看到的是哪张。
+      check(
+        "记下了这一段视频用的首帧（优先已生成的正面绿幕图）",
+        videoSettled?.turn.video.firstFrame === "images/front.png",
+        String(videoSettled?.turn.video.firstFrame)
+      );
+      check("转圈视频的提示词用的是转圈模板", /旋转满一整圈/.test(videoSettled?.prompts.turn ?? ""), (videoSettled?.prompts.turn ?? "").slice(0, 60));
+      await studio.savePrompts({ projectId, turn: "自定义转圈提示词" });
+      check("转圈提示词可单独保存", (await studio.getProject({ projectId })).prompts.turn === "自定义转圈提示词");
+      await studio.savePrompts({ projectId, resetTurnToDefault: true });
+      check("转圈提示词可一键重置为默认", /旋转满一整圈/.test((await studio.getProject({ projectId })).prompts.turn));
+    } finally {
+      await new Promise((resolve) => turnGateway.close(resolve));
+      await studio.saveConfig({ minimaxBaseUrl: "https://api.minimaxi.com", clearMinimaxApiKey: true });
+    }
+  }
+
+  // ── 9d. 本地自选视频 + 中间图片打包 ───────────────────────────────────
+  //
+  // 两处「需要生成视频」的地方（转圈视频、某个方向的行走视频）都允许直接用一段
+  // 本地文件顶替远程生成。产物必须与远端路径**完全同形**，而且旧产物必须一起作废
+  // ——留着上一段视频抽出来的帧，后面几步会拿着别的动作去合成，界面看着一切正常。
+  console.log("9d) 本地自选视频与中间图片打包（不联网、不花钱）");
+  {
+    const localFile = join(HOME, "local-walk.mp4");
+    await ffmpeg([
+      "-hide_banner", "-loglevel", "error", "-y",
+      "-f", "lavfi", "-i", "color=c=0x00c040:s=160x160:d=2:r=12",
+      "-f", "lavfi", "-i", "color=c=0xff8800:s=30x70:d=2:r=12",
+      "-filter_complex", "[0][1]overlay=x='20+90*t/2':y='45'",
+      "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast",
+      localFile
+    ]);
+    const localBytes = await readFile(localFile);
+    const localBase64 = localBytes.toString("base64");
+
+    // 先把这个方向的下游都置成 ready：导入本地视频必须把它们全部作废。
+    // 另一个方向（back）也一并置成 ready，用来验证「只动作点名的那一格」。
+    await patchProject(projectId, (project) => {
+      project.videos.front = { status: "ready", file: "videos/front.mp4", approved: true };
+      project.frames.front = {
+        status: "ready",
+        frames: ["frames/front/f00.png"],
+        keyed: ["keyed/front/f00.png"],
+        approved: true,
+        raw: "frames/front/raw.bin"
+      };
+      project.videos.back = { status: "ready", file: "videos/back.mp4", approved: true };
+      project.frames.back = { status: "ready", frames: ["frames/back/f00.png"], keyed: [], approved: true };
+      project.sheet = { status: "ready", file: "out/sheet.png", approved: true };
+    });
+
+    await expectThrow(
+      "本地视频：认不出容器的直接拒绝",
+      () => studio.uploadVideo({ projectId, key: "front", name: "x.mp4", data: png.toString("base64") }),
+      "无法识别的视频格式"
+    );
+    await expectThrow(
+      "本地视频：未知槽位直接拒绝",
+      () => studio.uploadVideo({ projectId, key: "frontt", name: "x.mp4", data: localBase64 }),
+      "未知方位"
+    );
+    await expectThrow(
+      "本地视频：项目不存在时报错",
+      () => studio.uploadVideo({ projectId: "p-not-exist", key: "front", name: "x.mp4", data: localBase64 }),
+      "项目不存在"
+    );
+
+    const imported = await studio.uploadVideo({ projectId, key: "front", name: "我的行走视频.mp4", data: localBase64 });
+    check(
+      "本地视频落到方向槽位（原名只当展示，落盘名按容器规范）",
+      imported.key === "front" && imported.file === "videos/front.mp4" && imported.bytes === localBytes.length,
+      JSON.stringify(imported)
+    );
+    const afterImport = await studio.getProject({ projectId });
+    check(
+      "节点与远端生成同形（status / file / approved）",
+      afterImport.videos.front.status === "ready" &&
+        afterImport.videos.front.file === "videos/front.mp4" &&
+        afterImport.videos.front.approved === false,
+      JSON.stringify(afterImport.videos.front)
+    );
+    check(
+      "标出来路是本地（origin=local）并记住原文件名",
+      afterImport.videos.front.origin === "local" && afterImport.videos.front.originalName === "我的行走视频.mp4",
+      `${afterImport.videos.front.origin} / ${afterImport.videos.front.originalName}`
+    );
+    check(
+      "旧的序列帧与整图一并作废（否则整图会混进上一段视频的帧）",
+      afterImport.frames.front.status === "empty" &&
+        afterImport.frames.front.frames.length === 0 &&
+        afterImport.frames.front.raw === undefined &&
+        afterImport.sheet.status === "empty",
+      `${afterImport.frames.front.status} / ${afterImport.frames.front.frames.length} 帧 / sheet=${afterImport.sheet.status}`
+    );
+    check(
+      "未点名的方向不受影响",
+      afterImport.videos.back.status === "ready" && afterImport.frames.back.status === "ready",
+      `${afterImport.videos.back.status} / ${afterImport.frames.back.status}`
+    );
+    check(
+      "导入写进运行日志（可追溯到用了哪个文件）",
+      afterImport.log.some((entry) => /已选用本地视频作为「南 · 正对镜头」的行走视频/.test(entry.message))
+    );
+
+    // 转圈视频：导入后必须**自动**抽候选帧并切出八个方向（与远端路径一致），
+    // 否则时间轴是空的，用户还得自己找按钮。
+    //
+    // 顺便覆盖「此刻正好有个远端任务在跑」：必须摘掉 taskId，否则它稍后拿到结果
+    // 会把本地视频直接覆盖掉（本地文件没了，任务号还指着远端）。
+    await patchProject(projectId, (project) => {
+      project.turn.video = { status: "running", taskId: "remote-task-in-flight", approved: false };
+    });
+    const turnImport = await studio.uploadVideo({ projectId, key: "turn", name: "turn-local.mp4", data: localBase64 });
+    check(
+      "本地视频落到转圈槽位，并自动开始抽候选帧",
+      turnImport.file === "videos/turn.mp4" && turnImport.extractStarted === true,
+      JSON.stringify(turnImport)
+    );
+    const afterTurnImport = await studio.getProject({ projectId });
+    check(
+      "远端在跑的任务号被摘掉（避免它回头覆盖本地视频）",
+      afterTurnImport.turn.video.taskId === undefined && afterTurnImport.turn.video.status === "ready",
+      JSON.stringify({ status: afterTurnImport.turn.video.status, taskId: afterTurnImport.turn.video.taskId })
+    );
+    check(
+      "转圈视频也标了 origin=local，且不再指向一张无关的首帧",
+      afterTurnImport.turn.video.origin === "local" && afterTurnImport.turn.video.firstFrame === undefined,
+      `${afterTurnImport.turn.video.origin} / ${afterTurnImport.turn.video.firstFrame ?? "(无)"}`
+    );
+    check(
+      "丢弃远端任务的处置写进了日志",
+      afterTurnImport.log.some((entry) => /原先的转圈视频远端任务/.test(entry.message))
+    );
+
+    let turnLocal = null;
+    for (let i = 0; i < 60; i++) {
+      await sleep(500);
+      const snapshot = await studio.getProject({ projectId });
+      const busy = (snapshot.jobs ?? []).some((job) => job.key === "turn:frames");
+      if (!busy && (snapshot.turn.frames.status === "ready" || snapshot.turn.frames.status === "error")) {
+        turnLocal = snapshot;
+        break;
+      }
+    }
+    check(
+      "本地转圈视频的候选帧真的抽出来了（ffmpeg 跑得动这段本地文件）",
+      turnLocal?.turn.frames.status === "ready",
+      `${turnLocal?.turn.frames.status ?? "超时"} ${turnLocal?.turn.frames.error ?? ""}`
+    );
+    check(
+      "八个方向图都由这段本地视频切出来",
+      Object.values(turnLocal?.images ?? {}).every((node) => node.status === "ready" && node.file.startsWith("images/")),
+      JSON.stringify(Object.fromEntries(Object.entries(turnLocal?.images ?? {}).map(([k, v]) => [k, v.status])))
+    );
+
+    // ── 中间图片打包 ────────────────────────────────────────────────────
+    //
+    // 先把整条本地链路跑到位（抽帧 → 抠像合成），包里才会同时出现
+    // 「抽出来的绿幕帧」和「抠好的帧」——否则这个断言只是在测一个空目录。
+    const waitFor = async (fn, timeoutMs = 30000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        const value = await fn();
+        if (value !== undefined && value !== null) return value;
+        await sleep(500);
+      }
+      return null;
+    };
+    // 转圈导入把八个方向的下游都作废了（切帧必然换朝向），所以这里补一段方向视频。
+    await studio.uploadVideo({ projectId, key: "front", name: "walk-again.mp4", data: localBase64 });
+    await studio.runFrames({ projectId, keys: ["front"] });
+    const framesSettled = await waitFor(async () => {
+      const snapshot = await studio.getProject({ projectId });
+      const busy = (snapshot.jobs ?? []).some((job) => job.key === "frames:extract");
+      return !busy && snapshot.frames.front.status === "ready" ? snapshot : null;
+    });
+    check("本地视频能被正常抽帧（第 3 步照旧）", framesSettled?.frames.front.status === "ready", String(framesSettled?.frames.front.status ?? "超时"));
+    await studio.compose({ projectId });
+    const composed = await waitFor(async () => {
+      const snapshot = await studio.getProject({ projectId });
+      return snapshot.sheet.status === "ready" ? snapshot : null;
+    });
+    check("本地视频的帧能合成整图", composed?.sheet.status === "ready", String(composed?.sheet.status ?? "超时"));
+
+    const freshProject = await studio.createProject({ name: "空项目·图片打包" });
+    await expectThrow(
+      "一张图都没有时拒绝打包（并说清先去做什么）",
+      () => studio.exportImages({ projectId: freshProject.projectId }),
+      "还没有任何图片可保存"
+    );
+
+    const pack = await studio.exportImages({ projectId });
+    check(
+      "打包返回相对路径 / 张数 / 字节数",
+      /^out\/.+\.zip$/.test(pack.file ?? "") && Number(pack.count) > 8 && Number(pack.bytes) > 0,
+      JSON.stringify({ file: pack.file, count: pack.count, bytes: pack.bytes })
+    );
+    check("打包结果自带 assetBase（界面据此直接下载）", /\/assets\/.+\/$/.test(pack.assetBase ?? ""), String(pack.assetBase));
+    const zipBytes = await readFile(join(projectRoot, pack.file));
+    const entries = readZip(zipBytes);
+    check("zip 能真解开（中央目录 / 长度 / CRC 都对）", entries.size === pack.count, `${entries.size} 个条目 vs 报告 ${pack.count}`);
+    // 包里保留项目内的相对路径，解压出来还能跟项目目录对上号。
+    const names = [...entries.keys()];
+    check(
+      "八方向绿幕图在包里（images/<方向>.png）",
+      ["front", "back", "left", "right"].every((key) => entries.has(`images/${key}.png`)),
+      names.filter((name) => name.startsWith("images/")).join(",")
+    );
+    check(
+      "转圈候选帧与条带在包里（turn/…）",
+      entries.has("turn/strip.png") && entries.has("turn/frames/f00.png"),
+      names.filter((name) => name.startsWith("turn/")).slice(0, 4).join(",")
+    );
+    check(
+      "抽出来的绿幕帧在包里（frames/…）",
+      entries.has("frames/front/f00.png"),
+      names.filter((name) => name.startsWith("frames/")).slice(0, 3).join(",")
+    );
+    check(
+      "抠完绿幕的帧在包里（keyed/…）",
+      entries.has("keyed/front/f00.png"),
+      names.filter((name) => name.startsWith("keyed/")).slice(0, 3).join(",")
+    );
+    check(
+      "合成整图也在包里（out/sheet.png）",
+      entries.has("out/sheet.png"),
+      names.filter((name) => name.startsWith("out/")).join(",")
+    );
+    check(
+      "包里的图是真 PNG（前 8 字节是 PNG 魔数）",
+      [...entries.values()].every((data) => data.length > 8 && data.subarray(0, 4).toString("hex") === "89504e47"),
+      `${entries.size} 个条目`
+    );
+    // 资源路由必须能取到这个 zip（白名单只比第一段路径，`out` 在名单里）：
+    // 漏了就是「点了保存，浏览器下到一个 403 页面」，而且界面只表现为「下载没反应」。
+    {
+      const zipServer = createServer((req, res) => void handler(req, res));
+      await new Promise((resolve) => zipServer.listen(0, "127.0.0.1", resolve));
+      const zipPort = zipServer.address().port;
+      const zipUrl = `http://127.0.0.1:${zipPort}/dsh-game-material-master/assets/${projectId}/${pack.file}`;
+      const zipResponse = await fetch(zipUrl);
+      const served = Buffer.from(await zipResponse.arrayBuffer());
+      check("打包好的 zip 能经资源路由下载（200）", zipResponse.status === 200, `${zipResponse.status}`);
+      check("路由给的字节与磁盘一致", served.length === zipBytes.length && served.subarray(0, 4).toString("hex") === "504b0304", `${served.length} vs ${zipBytes.length}`);
+      await new Promise((resolve) => zipServer.close(resolve));
+    }
+    check("打包写进运行日志", (await studio.getProject({ projectId })).log.some((entry) => /已打包 .* 张图片/.test(entry.message)));
+  }
+
+  // ── 10. 图片生成模块（本地链路，不调 API）────────────────────────────
+  console.log("10) 图片生成模块");
+  const ffmpegRun = (args) =>
+    new Promise((resolve, reject) => {
+      const child = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-y", ...args], { stdio: ["ignore", "ignore", "pipe"] });
+      let err = "";
+      child.stderr.on("data", (chunk) => (err += chunk));
+      child.on("close", (code) => (code === 0 ? resolve() : reject(new Error(err.slice(-300)))));
+      child.on("error", reject);
+    });
+
+  // 造一张绿幕测试图（绿底 + 橙色方块）
+  const greenFile = join(HOME, "green-source.png");
+  await ffmpegRun([
+    "-f", "lavfi", "-i", "color=c=0x00c040:s=200x200:d=1",
+    "-f", "lavfi", "-i", "color=c=0xff8800:s=60x120:d=1",
+    "-filter_complex", "[0][1]overlay=x=70:y=40",
+    "-frames:v", "1", greenFile
+  ]);
+  const greenPng = await readFile(greenFile);
+
+  const createdImage = await studio.createImageJob({ name: "测试图片任务" });
+  const imageId = createdImage.jobId;
+  check("图片任务 id 形如 i…", /^i[a-z0-9]+$/.test(imageId), imageId);
+
+  await studio.uploadImageRef({ jobId: imageId, name: "ref.png", data: greenPng.toString("base64") });
+  let imageJob = await studio.getImageJob({ jobId: imageId });
+  check("参考图已记录", imageJob.refs.length === 1, `${imageJob.refs.length} 张`);
+  check("图片任务带 assetBase", imageJob.assetBase.endsWith(`/image-assets/${imageId}/`), imageJob.assetBase);
+
+  // 生图模型是全局设置：客户端塞一个过期的模型 id，也必须被纠正回全局值。
+  await studio.saveImageJob({ jobId: imageId, settings: { model: "some-stale-model", size: "2K" } });
+  imageJob = await studio.getImageJob({ jobId: imageId });
+  check(
+    "图片任务的模型跟随全局设置",
+    imageJob.settings.model === (await studio.getConfig()).arkModel,
+    `${imageJob.settings.model} vs ${(await studio.getConfig()).arkModel}`
+  );
+
+  // 上传一张已有图片直接做抠像——这是「支持绿幕抠图生成 png」的主路径
+  await studio.addImageItem({ jobId: imageId, name: "green.png", data: greenPng.toString("base64") });
+  await studio.saveImageJob({
+    jobId: imageId,
+    prompt: "一只橙色的方块",
+    suffix: "不要出现文字",
+    keying: { enabled: true, keyLow: 14, keyHigh: 80, despill: 0.65, bgTolerance: 90, edgeShrink: 0 }
+  });
+  const keyKick = await studio.keyImageJob({ jobId: imageId });
+  check("抠像任务被接受", keyKick.started === true, JSON.stringify(keyKick));
+
+  let imageSettled = null;
+  for (let i = 0; i < 40; i++) {
+    await sleep(500);
+    const snapshot = await studio.getImageJob({ jobId: imageId });
+    if ((snapshot.items ?? []).every((item) => item.status !== "running") && (snapshot.items ?? []).some((item) => item.keyedFile !== undefined)) {
+      imageSettled = snapshot;
+      break;
+    }
+  }
+  check("抠像在合理时间内完成", imageSettled !== null, imageSettled === null ? "超时" : "已完成");
+  check("产出透明 PNG", typeof imageSettled?.items?.[0]?.keyedFile === "string", imageSettled?.items?.[0]?.keyedFile ?? "");
+  check(
+    "记录了背景占比（可判断抠像可信度）",
+    typeof imageSettled?.items?.[0]?.backgroundFraction === "number" && imageSettled.items[0].backgroundFraction > 0.4,
+    String(imageSettled?.items?.[0]?.backgroundFraction?.toFixed(2))
+  );
+  // 提示词与附加提示词要分开存，附加词可被清空
+  check("主提示词与附加提示词分开保存", imageSettled?.prompt === "一只橙色的方块" && imageSettled?.suffix === "不要出现文字");
+  await studio.saveImageJob({ jobId: imageId, suffix: "" });
+  imageJob = await studio.getImageJob({ jobId: imageId });
+  check("附加提示词可以被清空", imageJob.suffix === "");
+
+  // 资源路由要能取到抠像结果（前面的服务器已经关了，这里单开一个）
+  {
+    const server2 = createServer((req, res) => void handler(req, res));
+    await new Promise((resolve) => server2.listen(0, "127.0.0.1", resolve));
+    const port2 = server2.address().port;
+    try {
+      const keyedUrl = `http://127.0.0.1:${port2}/dsh-game-material-master/image-assets/${imageId}/${imageSettled.items[0].keyedFile}`;
+      const keyedRes = await fetch(keyedUrl).catch(() => null);
+      check("抠像结果可经资源路由取得", keyedRes !== null && keyedRes.status === 200, keyedRes === null ? "请求失败" : String(keyedRes.status));
+      const png = Buffer.from(await keyedRes.arrayBuffer());
+      check("抠像结果是合法 PNG（带 alpha）", png.readUInt32BE(16) === 200 && png.readUInt32BE(20) === 200 && png[25] === 6, `${png.readUInt32BE(16)}x${png.readUInt32BE(20)} 颜色类型 ${png[25]}`);
+      const badScope = await fetch(`http://127.0.0.1:${port2}/dsh-game-material-master/image-assets/${imageId}/../project.json`).catch(() => null);
+      check("新增模块同样挡住目录穿越", badScope !== null && [400, 403, 404].includes(badScope.status), badScope === null ? "请求失败" : String(badScope.status));
+      const badId = await fetch(`http://127.0.0.1:${port2}/dsh-game-material-master/sequence-assets/p000000000000/out/x.png`).catch(() => null);
+      check("跨模块用错 id 前缀会被拒绝", badId !== null && badId.status === 400, badId === null ? "请求失败" : String(badId.status));
+    } finally {
+      await new Promise((resolve) => server2.close(resolve));
+    }
+  }
+
+  // ── 11. 序列帧生成模块（本地链路，不调 API）────────────────────────────
+  console.log("11) 序列帧生成模块");
+  const createdSeq = await studio.createSequenceJob({ name: "测试序列帧任务" });
+  const seqId = createdSeq.jobId;
+  check("序列帧任务 id 形如 s…", /^s[a-z0-9]+$/.test(seqId), seqId);
+
+  await studio.uploadSequenceRef({ jobId: seqId, kind: "firstFrame", name: "first.png", data: greenPng.toString("base64") });
+  await studio.saveSequenceJob({
+    jobId: seqId,
+    mode: "frames",
+    prompt: "原地走三步",
+    suffix: "镜头固定",
+    settings: { frameCount: 4, longEdge: 96, cellWidth: 32, cellHeight: 32 },
+    keying: { keyLow: 14, keyHigh: 80, bgTolerance: 90 }
+  });
+  let seqJob = await studio.getSequenceJob({ jobId: seqId });
+  check("首帧图已记录", seqJob.refs.firstFrame?.file !== undefined, seqJob.refs.firstFrame?.file ?? "");
+  check("模式与参数已保存", seqJob.mode === "frames" && seqJob.settings.frameCount === 4, `${seqJob.mode} ${seqJob.settings.frameCount}`);
+
+  // 视频模型同样是全局设置：任务里不允许留一份会打错网关的旧模型副本
+  // （实测过的坑：任务存官方 H3 + 全局切优云智算 → cp.compshare.cn/v2/... 404）。
+  await studio.saveSequenceJob({ jobId: seqId, settings: { model: "MiniMax-H3", resolution: "480P" } });
+  seqJob = await studio.getSequenceJob({ jobId: seqId });
+  check(
+    "序列帧任务的模型跟随全局设置",
+    seqJob.settings.model === (await studio.getConfig()).minimaxModel,
+    `${seqJob.settings.model} vs ${(await studio.getConfig()).minimaxModel}`
+  );
+  check("序列帧分辨率跟着当前模型收敛", seqJob.settings.resolution === "2K", seqJob.settings.resolution);
+
+  // 切到优云智算版后，同一个任务再保存就应换成优云智算的模型与档位。
+  await studio.saveConfig({ minimaxModel: compshareId });
+  await studio.saveSequenceJob({ jobId: seqId, settings: { model: "MiniMax-H3", duration: 20, resolution: "1080P" } });
+  const cpSeqJob = await studio.getSequenceJob({ jobId: seqId });
+  check(
+    "切到优云智算后任务跟着换模型与档位",
+    cpSeqJob.settings.model === compshareId && cpSeqJob.settings.duration === 20 && cpSeqJob.settings.resolution === "1080P",
+    JSON.stringify(cpSeqJob.settings)
+  );
+  await studio.saveConfig({ minimaxModel: "MiniMax-H3", minimaxBaseUrl: "https://api.minimaxi.com" });
+
+  // 参考模式必须至少有一张参考图/一段参考视频
+  await studio.saveSequenceJob({ jobId: seqId, mode: "reference" });
+  await (async () => {
+    let threw = "";
+    try {
+      await studio.runSequenceVideo({ jobId: seqId });
+    } catch (error) {
+      threw = String(error?.message ?? error);
+    }
+    check("参考模式缺素材时拒绝提交", /至少要上传/.test(threw), threw.slice(0, 60) || "(没有抛错)");
+  })();
+  await (async () => {
+    await studio.saveSequenceJob({ jobId: seqId, mode: "frames" });
+    // 首尾帧模式也必须先有首帧图
+    const job2 = await import("../lib/seqgen.js").then((m) => m.readSequenceJob(seqId));
+    const backup = job2.refs.firstFrame;
+    job2.refs.firstFrame = undefined;
+    const m = await import("../lib/seqgen.js");
+    await m.writeSequenceJob(job2);
+    let threw = "";
+    try {
+      await studio.runSequenceVideo({ jobId: seqId });
+    } catch (error) {
+      threw = String(error?.message ?? error);
+    }
+    check("首尾帧模式缺首帧图时拒绝提交", /必须上传一张首帧图/.test(threw), threw.slice(0, 60) || "(没有抛错)");
+    job2.refs.firstFrame = backup;
+    await m.writeSequenceJob(job2);
+  })();
+  await studio.saveSequenceJob({ jobId: seqId, mode: "frames" });
+
+  // 直接塞一段本地视频，跳过付费的视频生成，验证后面的抽帧/抠像/合成
+  const seqgenMod = await import("../lib/seqgen.js");
+  const seqVideoFile = join(HOME, "seq-source.mp4");
+  await ffmpegRun([
+    "-f", "lavfi", "-i", "color=c=0x00c040:s=160x160:d=2:r=12",
+    "-f", "lavfi", "-i", "color=c=0xff8800:s=40x80:d=2:r=12",
+    "-filter_complex", "[0][1]overlay=x='30+50*sin(2*PI*t)':y='40'",
+    "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "ultrafast", seqVideoFile
+  ]);
+  await (async () => {
+    const job = await seqgenMod.readSequenceJob(seqId);
+    const rel = "videos/output.mp4";
+    await writeFile(join(HOME, "game-material-master", "sequence-jobs", seqId, rel), await readFile(seqVideoFile));
+    job.video = { status: "ready", file: rel, updatedAt: Date.now() };
+    await seqgenMod.writeSequenceJob(job);
+  })();
+
+  const framesKick = await studio.runSequenceFrames({ jobId: seqId, count: 4 });
+  check("抽帧任务被接受", framesKick.started === true, JSON.stringify(framesKick));
+  let seqSettled = null;
+  for (let i = 0; i < 60; i++) {
+    await sleep(500);
+    const snapshot = await studio.getSequenceJob({ jobId: seqId });
+    // 抽帧完成后还会接着抠像与合成条图，`sheet` 在条图开始前仍是 empty——
+    // 必须等它落到终态（ready / error），否则会在中间态上提前判定收敛。
+    const framesDone =
+      snapshot.frames.status === "ready" &&
+      snapshot.frames.files.length > 0 &&
+      snapshot.frames.keyed.length === snapshot.frames.files.length;
+    if (framesDone && (snapshot.sheet.status === "ready" || snapshot.sheet.status === "error")) {
+      seqSettled = snapshot;
+      break;
+    }
+  }
+  check("抽帧在合理时间内完成", seqSettled?.frames.status === "ready", `${seqSettled?.frames.status} ${seqSettled?.frames.error ?? ""}`);
+  check("按配置张数抽出帧", seqSettled?.frames.files.length === 4, `${seqSettled?.frames?.files?.length} 张`);
+  check("自动完成抠像", seqSettled?.frames.keyed.length === 4, `${seqSettled?.frames?.keyed?.length} 帧`);
+  check("自动完成横向合成", seqSettled?.sheet.status === "ready", `${seqSettled?.sheet.status} ${seqSettled?.sheet.error ?? ""}`);
+  check("条图尺寸 = 4 列 × 32px", seqSettled?.sheet.width === 128 && seqSettled?.sheet.height === 32, `${seqSettled?.sheet?.width}x${seqSettled?.sheet?.height}`);
+
+  // 关键帧直接播放要用到：抠好的帧必须能经资源路由取到
+  {
+    const server3 = createServer((req, res) => void handler(req, res));
+    await new Promise((resolve) => server3.listen(0, "127.0.0.1", resolve));
+    const port3 = server3.address().port;
+    try {
+      const frameUrl = `http://127.0.0.1:${port3}/dsh-game-material-master/sequence-assets/${seqId}/${seqSettled.frames.keyed[0]}`;
+      const frameRes = await fetch(frameUrl).catch(() => null);
+      check("抠像帧可经资源路由取得（播放预览依赖它）", frameRes !== null && frameRes.status === 200, frameRes === null ? "请求失败" : String(frameRes.status));
+    } finally {
+      await new Promise((resolve) => server3.close(resolve));
+    }
+  }
+
+  // 改抽帧参数要标记 stale
+  await studio.saveSequenceJob({ jobId: seqId, settings: { longEdge: 320 } });
+  const seqStale = await studio.getSequenceJob({ jobId: seqId });
+  check("改抽帧参数后标记需重抽", seqStale.frames.stale === true);
+
+  await studio.deleteImageJob({ jobId: imageId });
+  await studio.deleteSequenceJob({ jobId: seqId });
+  const imageJobsAfter = await studio.listImageJobs();
+  const seqJobsAfter = await studio.listSequenceJobs();
+  check("图片任务已删除", !imageJobsAfter.jobs.some((item) => item.id === imageId));
+  check("序列帧任务已删除", !seqJobsAfter.jobs.some((item) => item.id === seqId));
+
+
+  // ── 12. 骨骼动画生成模块（本地链路，不调 API）──────────────────────────
+  console.log("12) 骨骼动画生成模块");
+  const createdRig = await studio.createRigJob({ name: "测试骨骼动画任务" });
+  const rigId = createdRig.jobId;
+  check("骨骼动画任务 id 形如 r…", /^r[a-z0-9]+$/.test(rigId), rigId);
+
+  // 参考图与部件都用合成素材，走真实的上传 → 装配 → 骨骼 → 图集链路。
+  {
+    const W = 240;
+    const H = 360;
+    const ref = Buffer.alloc(W * H * 4);
+    const part = (x, y, w, h, rgb) => {
+      const data = Buffer.alloc(w * h * 4);
+      for (let py = 0; py < h; py++) {
+        for (let px = 0; px < w; px++) {
+          const i = (py * w + px) * 4;
+          const shade = Math.round(28 * Math.sin((px / w) * 6) + 20 * Math.cos((py / h) * 7));
+          data[i] = Math.max(0, Math.min(255, rgb[0] + shade));
+          data[i + 1] = Math.max(0, Math.min(255, rgb[1] + shade));
+          data[i + 2] = Math.max(0, Math.min(255, rgb[2] + shade));
+          data[i + 3] = 255;
+        }
+      }
+      return { data, w, h, x, y };
+    };
+    const blit = (canvas, cw, source) => {
+      for (let py = 0; py < source.h; py++) {
+        for (let px = 0; px < source.w; px++) {
+          const tx = source.x + px;
+          const ty = source.y + py;
+          if (tx < 0 || ty < 0 || tx >= cw) continue;
+          const di = (ty * cw + tx) * 4;
+          if (di + 3 >= canvas.length) continue;
+          const si = (py * source.w + px) * 4;
+          canvas[di] = source.data[si];
+          canvas[di + 1] = source.data[si + 1];
+          canvas[di + 2] = source.data[si + 2];
+          canvas[di + 3] = 255;
+        }
+      }
+    };
+    // 参考图：白底 + 三个互不重叠的色块（头/躯干/腿）。
+    for (let i = 0; i < W * H; i++) {
+      ref[i * 4] = 250;
+      ref[i * 4 + 1] = 250;
+      ref[i * 4 + 2] = 248;
+      ref[i * 4 + 3] = 255;
+    }
+    const boxes = [
+      { name: "head", x: 95, y: 30, w: 50, h: 55, rgb: [232, 196, 156] },
+      { name: "torso", x: 85, y: 100, w: 70, h: 120, rgb: [72, 110, 190] },
+      { name: "left-upper-leg", x: 90, y: 230, w: 26, h: 90, rgb: [60, 70, 92] }
+    ];
+    for (const box of boxes) blit(ref, W, part(box.x, box.y, box.w, box.h, box.rgb));
+
+    await studio.uploadRigSource({ jobId: rigId, name: "character.png", data: encodePng(ref, W, H).toString("base64") });
+    for (const box of boxes) {
+      const raster = part(0, 0, Math.round(box.w * 1.4), Math.round(box.h * 1.4), box.rgb);
+      await studio.uploadRigPart({ jobId: rigId, name: `${box.name}.png`, data: encodePng(raster.data, raster.w, raster.h).toString("base64") });
+    }
+
+    const rigView = await studio.getRigJob({ jobId: rigId });
+    check("任务视图带相对 URL（浏览器直接用）", typeof rigView.sourceUrl === "string" && rigView.sourceUrl.startsWith("/"), String(rigView.sourceUrl));
+    check("任务视图带四个阶段", rigView.stages.length === 4 && rigView.stages[0].stage === "parts");
+    check("任务视图带逐部件清单", rigView.parts.length === boxes.length && typeof rigView.parts[0].url === "string");
+    check("Renaming 之后 id 前缀仍被识别", /^r/.test(rigView.id));
+
+    // 上传的部件名取自文件名——骨骼层级完全依赖它。
+    check("部件名取自文件名", boxes.every((box) => rigView.parts.some((part) => part.name === box.name)), rigView.parts.map((p) => p.name).join(","));
+
+    // 生成类是后台任务：立刻返回 {started:true}，要等它落盘再断言。
+    const settleRig = async (stage, timeoutMs = 120000) => {
+      const deadline = Date.now() + timeoutMs;
+      let view = await studio.getRigJob({ jobId: rigId });
+      while (Date.now() < deadline) {
+        const entry = view.stages.find((item) => item.stage === stage);
+        if (entry !== undefined && entry.status !== "running" && view.busy !== true) return view;
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        view = await studio.getRigJob({ jobId: rigId });
+      }
+      return view;
+    };
+
+    await studio.runRigLayout({ jobId: rigId });
+    let rigState = await settleRig("layout");
+    check("装配阶段完成", rigState.layout.status === "ready", rigState.layout.error ?? "");
+    check("装配出对比图", typeof rigState.layout.comparison === "string");
+    check("装配结果逐部件都有坐标", Object.keys(rigState.layout.items).length === boxes.length);
+
+    await studio.runRigBones({ jobId: rigId });
+    rigState = await settleRig("rig");
+    check("骨骼阶段完成", rigState.rig.status === "ready", rigState.rig.error ?? "");
+    check("骨骼数 = 部件数 + root", rigState.rig.bones === boxes.length + 1, String(rigState.rig.bones));
+    check("六个动画齐全", rigState.rig.animations.length === 6, rigState.rig.animations.join(","));
+
+    await studio.runRigAtlas({ jobId: rigId });
+    rigState = await settleRig("atlas");
+    check("图集阶段完成", rigState.atlas.status === "ready", rigState.atlas.error ?? "");
+    check("图集区域数 = 部件数", rigState.atlas.regions === boxes.length, String(rigState.atlas.regions));
+
+    // 资源路由：预览页必须是 text/html，否则 iframe 只会下载文件。
+    {
+      const server3 = createServer((req, res) => void handler(req, res));
+      await new Promise((resolve) => server3.listen(0, "127.0.0.1", resolve));
+      const port3 = server3.address().port;
+      try {
+        const base = `http://127.0.0.1:${port3}/dsh-game-material-master/rig-assets/${rigId}`;
+        const preview = await fetch(`${base}/rig/preview.html`).catch(() => null);
+        check("预览页可经资源路由取得", preview !== null && preview.status === 200, preview === null ? "请求失败" : String(preview.status));
+        check(
+          "预览页的 Content-Type 是 text/html（iframe 才能渲染）",
+          preview !== null && String(preview.headers.get("content-type")).startsWith("text/html"),
+          preview === null ? "无响应" : String(preview.headers.get("content-type"))
+        );
+        const html = preview === null ? "" : await preview.text();
+        check("预览页内联了骨架与部件图", html.includes("data:image/png;base64,") && html.includes("4.2.0"));
+        check("预览页没有外部依赖", !/<script[^>]+src=/.test(html) && !/<link[^>]+href=/.test(html));
+
+        const skeleton = await fetch(`${base}/rig/skeleton.json`).catch(() => null);
+        check("骨架 JSON 可取得且是 JSON 类型", skeleton !== null && skeleton.status === 200 && String(skeleton.headers.get("content-type")).includes("json"), skeleton === null ? "请求失败" : String(skeleton.status));
+        const atlasText = await fetch(`${base}/atlas/skeleton.atlas`).catch(() => null);
+        check("图集文本可取得", atlasText !== null && atlasText.status === 200, atlasText === null ? "请求失败" : String(atlasText.status));
+        // `export/` 是第二条导出路径（DragonBones 5.5）。白名单只比对第一段路径，
+        // 漏加它就表现为「产物在磁盘上、界面上点开是 403」——实测就是这么撞上的。
+        const dbSkeleton = await fetch(`${base}/export/dragonbones/skeleton_ske.json`).catch(() => null);
+        check("DragonBones 骨架可经资源路由取得", dbSkeleton !== null && dbSkeleton.status === 200,
+          dbSkeleton === null ? "请求失败" : String(dbSkeleton.status));
+        check("DragonBones 骨架的 Content-Type 是 JSON",
+          dbSkeleton !== null && String(dbSkeleton.headers.get("content-type")).includes("json"),
+          dbSkeleton === null ? "无响应" : String(dbSkeleton.headers.get("content-type")));
+        const dbTexture = await fetch(`${base}/atlas/skeleton_tex.json`).catch(() => null);
+        check("DragonBones 贴图描述可取得", dbTexture !== null && dbTexture.status === 200,
+          dbTexture === null ? "请求失败" : String(dbTexture.status));
+        const unlisted = await fetch(`${base}/secret/x.json`).catch(() => null);
+        check("未列入白名单的子目录仍然被拒绝", unlisted !== null && unlisted.status === 403,
+          unlisted === null ? "请求失败" : String(unlisted.status));
+        const escape = await fetch(`${base}/parts/../../../project.json`).catch(() => null);
+        check("骨骼动画模块同样挡住目录穿越", escape !== null && [400, 403, 404].includes(escape.status), escape === null ? "请求失败" : String(escape.status));
+        const badPrefix = await fetch(`http://127.0.0.1:${port3}/dsh-game-material-master/rig-assets/p000000000000/rig/preview.html`).catch(() => null);
+        check("骨骼动画：跨模块用错 id 前缀会被拒绝", badPrefix !== null && badPrefix.status === 400, badPrefix === null ? "请求失败" : String(badPrefix.status));
+      } finally {
+        await new Promise((resolve) => server3.close(resolve));
+      }
+    }
+
+    // 手动装配：批量写入 / 为没有记录的部件建条目 / 收回未摆放状态。
+    {
+      const boxOf = (view, name) => view.layout.items[name];
+      const before = await studio.getRigJob({ jobId: rigId });
+      const target = before.parts[0].name;
+      const moved = boxOf(before, target);
+      const result = await studio.saveRigLayoutItems({
+        jobId: rigId,
+        items: [{ name: target, x: moved.x + 17, y: moved.y + 23, width: moved.width + 6, height: moved.height + 4, rotation: 12, z: 3 }]
+      });
+      check("批量手动装配返回改动数", result.touched === 1, String(result.touched));
+      let after = await studio.getRigJob({ jobId: rigId });
+      const next = boxOf(after, target);
+      check("手动装配生效", next.x === moved.x + 17 && next.y === moved.y + 23, `${next.x},${next.y}`);
+      check("手动装配标记 manual 并算出 scale", next.manual === true && next.scale > 0, `scale=${next.scale}`);
+      check("手动装配让骨骼与图集作废", after.rig.status === "empty" && after.atlas.status === "empty");
+      // 视图里的 URL 是拼好的（界面直接用），所以看后缀而不是相对路径。
+      check(
+        "手动装配后合成图重新生成",
+        typeof after.layout.composite === "string" && after.layout.composite.endsWith("layout/composite.png"),
+        String(after.layout.composite)
+      );
+
+      // 收回未摆放状态：matched 变 false，但记录仍在（这样才能再拖回来）。
+      await studio.saveRigLayoutItems({ jobId: rigId, items: [{ name: target, placed: false }] });
+      after = await studio.getRigJob({ jobId: rigId });
+      check("可以把手动装配的部件收回未摆放", boxOf(after, target).matched === false);
+      await studio.saveRigLayoutItems({ jobId: rigId, items: [{ name: target, placed: true }] });
+      after = await studio.getRigJob({ jobId: rigId });
+      check("收回后还能再放回画布", boxOf(after, target).matched === true);
+
+      let threw2 = false;
+      try {
+        await studio.saveRigLayoutItems({ jobId: rigId, items: [{ name: "no-such-part", x: 1 }] });
+      } catch {
+        threw2 = true;
+      }
+      check("手动装配给不存在的部件会报错", threw2);
+    }
+
+    await studio.deleteRigJob({ jobId: rigId });
+    const rigJobsAfter = await studio.listRigJobs();
+    check("骨骼动画任务已删除", !rigJobsAfter.jobs.some((item) => item.id === rigId));
+  }
+
+  // ── 13b. 换源图：由旧源图派生的产物必须整体作废 ────────────────────────
+  //
+  // ⚠️ 这一节钉的是**静默**那一种坏法：换源图只改 project.source 的话，转圈首帧仍然优先
+  // 用旧的 images/front.png（turnFirstFrame：正面绿幕图 > 源图），于是「新角色配旧脸」——
+  // 不报错、日志也看不出来，只有肉眼看图才发现。
+  console.log("13b) 换源图作废派生产物");
+  {
+    const { patchProject: patch, projectDir } = await import("../lib/store.js");
+    const { mkdir, utimes, writeFile } = await import("node:fs/promises");
+    const { dirname } = await import("node:path");
+    const fresh = await studio.createProject({ name: "换源图" });
+    const freshId = fresh.projectId;
+    const freshRoot = projectDir(freshId);
+    await studio.uploadSource({ projectId: freshId, name: "old.png", data: png.toString("base64") });
+
+    // 伪造一套「已经生成过」的派生状态，并把产物真的写到盘上——不写文件就测不出「删没删盘」。
+    const derived = [
+      "images/front.png", "videos/turn.mp4", "turn/f00.png", "turn/strip.png",
+      "videos/front.mp4", "frames/front/f00.png", "out/sheet.png"
+    ];
+    for (const relative of derived) {
+      await mkdir(dirname(join(freshRoot, relative)), { recursive: true });
+      await writeFile(join(freshRoot, relative), png);
+    }
+    await patch(freshId, (project) => {
+      project.images.front = { status: "ready", file: "images/front.png", approved: true };
+      project.turn.video = { status: "ready", file: "videos/turn.mp4", approved: false, firstFrame: "images/front.png" };
+      project.turn.frames = {
+        status: "ready", frames: ["turn/f00.png"], times: [0], picks: { front: 0 },
+        strip: "turn/strip.png", rawFrameCount: 1, approved: true
+      };
+      project.videos.front = { status: "ready", file: "videos/front.mp4", approved: true };
+      project.frames.front = { status: "ready", frames: ["frames/front/f00.png"], keyed: [], approved: true };
+      project.sheet = { status: "ready", file: "out/sheet.png", approved: true };
+    });
+
+    const swapped = await studio.uploadSource({ projectId: freshId, name: "new.png", data: png.toString("base64") });
+    check("换源图返回作废个数", swapped.discarded >= 7, String(swapped.discarded));
+    check("源图确实换成了新的", swapped.file === "source/new.png", String(swapped.file));
+
+    const wiped = await studio.getProject({ projectId: freshId });
+    check(
+      "方向图 / 转圈视频 / 候选帧 / 序列帧 / 整图全部作废",
+      wiped.images.front.status === "empty" &&
+        wiped.turn.video.status === "empty" &&
+        wiped.turn.frames.status === "empty" &&
+        wiped.turn.frames.frames.length === 0 &&
+        wiped.videos.front.status === "empty" &&
+        wiped.frames.front.status === "empty" &&
+        wiped.sheet.status === "empty",
+      JSON.stringify({
+        images: wiped.images.front.status, turn: wiped.turn.video.status, candidates: wiped.turn.frames.status,
+        video: wiped.videos.front.status, frames: wiped.frames.front.status, sheet: wiped.sheet.status
+      })
+    );
+    check(
+      "八个截帧位置按当前候选帧数重新等分（旧位置指的是旧视频的帧号）",
+      wiped.turn.frames.picks.front === 0 && Object.keys(wiped.turn.frames.picks).length === 8,
+      JSON.stringify(wiped.turn.frames.picks)
+    );
+    check(
+      "换源图会在日志里说明作废了什么",
+      wiped.log.some((entry) => entry.level === "warn" && /换了源图：已作废/.test(entry.message))
+    );
+    for (const relative of derived) {
+      let gone = false;
+      try {
+        await readFile(join(freshRoot, relative));
+      } catch {
+        gone = true;
+      }
+      check(`旧产物已从磁盘删掉：${relative}`, gone);
+    }
+
+    // 第一次上传（还没有派生产物）不该报作废，也不该刷告警日志。
+    const beforePlain = (await studio.getProject({ projectId: freshId })).log.length;
+    const plain = await studio.uploadSource({ projectId: freshId, name: "third.png", data: png.toString("base64") });
+    const plainState = await studio.getProject({ projectId: freshId });
+    check("没有派生产物时作废数为 0", plain.discarded === 0, String(plain.discarded));
+    check(
+      "没有派生产物时不写告警日志（只看这次上传新增的那几条）",
+      !plainState.log.slice(beforePlain).some((entry) => /换了源图：已作废/.test(entry.message))
+    );
+
+    const renamed = await studio.uploadSource({ projectId: freshId, name: "fourth.png", data: png.toString("base64") });
+    check("再换一次仍然按新文件名落盘", renamed.file === "source/fourth.png", String(renamed.file));
+
+    // 首帧保险：正面绿幕图比源图旧 → 退回源图。换源图本来就会作废派生产物，
+    // 但历史项目 / 手工替换文件都可能带着「旧角色的正面图」，而首帧正是交给
+    // 模型的那一张图 —— 兜不住就是「新角色配旧脸」且不报错。
+    await mkdir(join(freshRoot, "images"), { recursive: true });
+    await writeFile(join(freshRoot, "images", "front.png"), png);
+    const anHourAgo = new Date(Date.now() - 3600 * 1000);
+    await utimes(join(freshRoot, "images", "front.png"), anHourAgo, anHourAgo);
+    await patch(freshId, (project) => {
+      project.images.front = { status: "ready", file: "images/front.png", approved: false };
+    });
+
+    const gateway = createServer((req, res) => {
+      req.resume();
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ base_resp: { status_code: 1004, status_msg: "invalid api key (verify)" } }));
+    });
+    await new Promise((resolve) => gateway.listen(0, "127.0.0.1", resolve));
+    await studio.saveConfig({
+      minimaxApiKey: "fake-key-for-verification",
+      minimaxBaseUrl: `http://127.0.0.1:${gateway.address().port}`
+    });
+    try {
+      const kicked = await studio.runTurnVideo({ projectId: freshId });
+      check("转圈视频提交被接受（首帧保险）", kicked.started === true, JSON.stringify(kicked));
+      let guarded = null;
+      for (let i = 0; i < 40; i++) {
+        await sleep(500);
+        const snapshot = await studio.getProject({ projectId: freshId });
+        if (snapshot.turn.video.status === "error" || snapshot.turn.video.status === "ready") {
+          guarded = snapshot;
+          break;
+        }
+      }
+      check(
+        "正面绿幕图比源图旧时改用源图当首帧",
+        guarded?.turn.video.firstFrame === "source/fourth.png",
+        String(guarded?.turn.video.firstFrame)
+      );
+      check("并把原因写进日志", (guarded?.log ?? []).some((entry) => /正面绿幕图比源图旧/.test(entry.message)));
+    } finally {
+      await new Promise((resolve) => gateway.close(resolve));
+      await studio.saveConfig({ minimaxBaseUrl: "https://api.minimaxi.com", clearMinimaxApiKey: true });
+    }
+    await studio.deleteProject({ projectId: freshId });
+  }
+
+  // ── 14. 地图地块的资源路由 ─────────────────────────────────────────────
+  //
+  // ⚠️ 这一节钉的是一个**静默坏掉**的点：路由里的 scope 白名单有**两处**——
+  // `AssetScope` 类型和 `handleAsset` 里的运行时判断。只改类型不改判断，
+  // TypeScript 不会报错（scope 是断言出来的），请求直接掉进 404，
+  // 界面表现只是「图裂了」。实测 `tile-assets` 就这么漏过一轮。
+  console.log("14) 地图地块的资源路由");
+  {
+    const tilegen = await import("../lib/tilegen.js");
+    // 自己起一台 server：`handler` 与前面几节用的是同一个，但端口各节独立。
+    const server4 = createServer((req, res) => void handler(req, res));
+    await new Promise((resolve) => server4.listen(0, "127.0.0.1", resolve));
+    const port4 = server4.address().port;
+    const tile = await studio.createTileProject({ name: "路由验证" });
+    const tileId = tile.id;
+    try {
+      check("项目 id 形如 t…", tilegen.isValidTileProjectId(tileId), tileId);
+      check("view 带 assetBase 且指向 tile-assets",
+        String(tile.assetBase).endsWith(`/tile-assets/${tileId}/`), String(tile.assetBase));
+
+      // 真写一个模板文件，再从 HTTP 路由取回来
+      const { mkdir: mkdirp, writeFile: writeF } = await import("node:fs/promises");
+      await mkdirp(join(tilegen.tileProjectDir(tileId), "template"), { recursive: true });
+      await writeF(join(tilegen.tileProjectDir(tileId), "template", "cell.png"), encodePng(Buffer.from([255, 0, 0, 255]), 1, 1));
+
+      const base = `http://127.0.0.1:${port4}/dsh-game-material-master/tile-assets/${tileId}`;
+      const cell = await fetch(`${base}/template/cell.png`).catch(() => null);
+      check("模板图可经资源路由取得（tile-assets 在白名单里）",
+        cell !== null && cell.status === 200, cell === null ? "请求失败" : String(cell.status));
+      check("模板图的 Content-Type 是 image/png",
+        cell !== null && String(cell.headers.get("content-type")).startsWith("image/png"),
+        cell === null ? "无响应" : String(cell.headers.get("content-type")));
+
+      // 不在白名单里的子目录必须 403（project.json 在项目根，第一段就是文件名）
+      const outside = await fetch(`${base}/project.json`).catch(() => null);
+      check("项目根文件不走资源路由（403）",
+        outside !== null && outside.status === 403, outside === null ? "请求失败" : String(outside.status));
+
+      // 目录穿越必须被挡
+      const traverse = await fetch(`${base}/template/../../project.json`).catch(() => null);
+      check("目录穿越被挡（非 200）",
+        traverse === null || traverse.status !== 200, traverse === null ? "请求失败" : String(traverse.status));
+    } finally {
+      server4.close();
+      await studio.deleteTileProject({ projectId: tileId });
+    }
+    const tileList = await studio.listTileProjects();
+    check("地图地块项目已删除", !tileList.projects.some((item) => item.id === tileId));
+  }
+
+  // ── 15. 删除 ───────────────────────────────────────────────────────────
+  console.log("15) 删除项目");
+  await studio.deleteProject({ projectId });
+  const after = await studio.listProjects();
+  check("项目已从列表移除", !after.projects.some((p) => p.id === projectId));
+
+  console.log(`\n共 ${checks} 项检查，失败 ${failures.length} 项。`);
+  if (failures.length > 0) {
+    console.error(`失败项：${failures.join("、")}`);
+    return 1;
+  }
+  console.log("宿主半区全部通过。");
+  return 0;
+}
+
+let code = 1;
+try {
+  code = await main();
+} catch (error) {
+  console.error("\n测试本身崩溃：", error);
+  code = 1;
+} finally {
+  await rm(HOME, { recursive: true, force: true });
+}
+process.exit(code);

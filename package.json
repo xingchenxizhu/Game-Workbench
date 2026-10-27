@@ -1,0 +1,75 @@
+{
+  "name": "ai-game-workbench",
+  "version": "3.6.0",
+  "type": "module",
+  "description": "AI 游戏工作台：浏览器网页与 DeepSeek Harness 插件双形态。素材生成、抠图/调色/放大、角色动画、地图场景、音频、视频与策划文档；AI 生图走任务/回填桥。",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "engines": {
+    "node": ">=22.18",
+    "dsh": ">=0.2.0-rc.2 <0.3.0-0"
+  },
+  "files": [
+    "src",
+    "tsconfig*.json",
+    "tools",
+    "tests",
+    "*.cmd",
+    "lib",
+    "public",
+    "modules",
+    "cordis.patch.yml",
+    "README.md",
+    ".agents/skills/game-workbench-imagegen",
+    "assets/samples/test-grid.png",
+    "docs"
+  ],
+  "scripts": {
+    "start": "node lib/launch.js",
+    "build": "npm run build:classic && npm run build:client && npm run build:server && npm run build:plugin",
+    "build:classic": "tsc -p tsconfig.classic.json",
+    "build:client": "tsc -p tsconfig.client.json",
+    "build:server": "tsc -p tsconfig.server.json",
+    "build:plugin": "tsc -p tsconfig.plugin.json",
+    "typecheck": "tsc -p tsconfig.classic.json --noEmit && tsc -p tsconfig.client.json --noEmit && tsc -p tsconfig.server.json --noEmit && tsc -p tsconfig.plugin.json --noEmit",
+    "test": "node --test tests/*.test.ts",
+    "check": "node tools/check-shell-dom.ts",
+    "check:ts": "node tools/audit-typescript.ts",
+    "check:ui": "node tools/check-workspace-ui.ts",
+    "check:video": "node tools/check-video-api.ts",
+    "check:plugin": "node tools/check-plugin-host.ts",
+    "check:all": "npm run check:ts && npm run check && npm run check:video && npm run check:plugin",
+    "check:production": "node tools/check-production-tools.ts",
+    "check:stitch": "node tools/check-stitch-ui.ts",
+    "check:auto-image": "node tools/check-auto-image-ui.ts",
+    "check:image-live": "node tools/check-native-image-live.ts"
+  },
+  "dependencies": {
+    "@deepseek-ai/cordis": "~4.0.5",
+    "@deepseek-ai/dsh-typert-protocol": "^0.2.1-rc.2",
+    "ag-psd": "^33.0.0",
+    "jszip": "^3.10.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@esotericsoftware/spine-core": "4.2.120",
+    "@types/node": "^24.0.0",
+    "jsdom": "^27.0.0",
+    "playwright": "^1.56.0",
+    "typescript": "^5.9.3"
+  }
+}

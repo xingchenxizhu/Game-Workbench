@@ -1,0 +1,823 @@
+/**
+ * 自包含骨骼动画预览（HTML）。
+ *
+ * 为什么不用官方 Spine Web Player：它要从 CDN 拉 `spine-player.js`，而验收页
+ * 可能在没有外网的环境里打开（本机离线、内网、或者 CDN 被墙）。这个预览把
+ * 部件图片与骨架 JSON 全部以 base64 内联，**零外部依赖**，双击就能看。
+ *
+ * 渲染器实现的是 spine-core 的那套语义：
+ *   - 骨骼局部量 = setup(x, y, rotation) + 动画增量；子骨骼的位移要先用
+ *     父骨骼的旋转去转，再叠加到父骨骼世界坐标上。
+ *   - 挂点 (x, y) 是图片中心相对骨骼原点的位移，处在骨骼局部坐标系里；
+ *     `rotation` 是挂点自身的局部旋转（我们用它在初始姿态里抵消骨骼朝向，
+ *     让装配结果逐像素还原）。
+ *   - 动画曲线是 **Spine 4.2 的绝对贝塞尔**：4 个数给单属性（rotate 的 value），
+ *     8 个数给双属性（translate 的 x、y 各占 4 个）。控制点是 (时间, 值) 空间里
+ *     的绝对坐标，因此要在 x(u)=t 上反解 u，再取 y(u)。
+ */
+function safeJson(value) {
+    // JSON 里可能出现 `</script>`，直接内联会提前结束脚本块。
+    return JSON.stringify(value).replace(/<\//g, "<\\/");
+}
+export function buildPreviewHtml(options) {
+    const title = options.title ?? "骨骼动画预览";
+    const images = Object.fromEntries(options.images.map((image) => [image.name, image.dataUri]));
+    const animations = Object.keys(options.spine?.animations ?? {});
+    const defaultAnimation = options.defaultAnimation !== undefined && animations.includes(options.defaultAnimation)
+        ? options.defaultAnimation
+        : animations[0] ?? "";
+    const background = options.background ?? "#12121c";
+    const paths = options.paths ?? {};
+    return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>${title}</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: ${background};
+    color: #e6e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column; align-items: center; gap: 14px; padding: 18px;
+  }
+  h1 { font-size: 16px; font-weight: 600; letter-spacing: .04em; color: #aab4d4; }
+  #stage { border-radius: 12px; overflow: hidden; box-shadow: 0 10px 40px rgba(0,0,0,.55); background: #1b1b28; }
+  canvas { display: block; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; align-items: center; }
+  button {
+    background: #262a3d; color: #cfd6ea; border: 1px solid #363c56; border-radius: 8px;
+    padding: 6px 12px; font-size: 13px; cursor: pointer; transition: .15s;
+  }
+  button:hover { background: #31374f; }
+  button.active { background: #3f6fff; border-color: #3f6fff; color: #fff; }
+  .meta { font-size: 12px; color: #7c86a6; }
+  input[type=range] { width: 220px; }
+</style>
+</head>
+<body>
+<h1>${escapeHtml(title)}</h1>
+<div id="stage"><canvas id="cv"></canvas></div>
+<div class="bar" id="anims"></div>
+<div class="bar">
+  <button id="play">⏸ 暂停</button>
+  <input type="range" id="scrub" min="0" max="1000" value="0" />
+  <button id="bones">骨骼</button>
+  <button id="grid">网格</button>
+  <span class="meta" id="tip"></span>
+</div>
+<div class="meta">内联渲染，无外部依赖；切换动画即时生效。</div>
+<script>
+(function () {
+  var SPINE = ${safeJson(options.spine)};
+  var IMAGE_DATA = ${safeJson(images)};
+  var ANIMS = ${safeJson(animations)};
+  // Path 约束（名字 → 路径 + 骨链）。点已经是骨骼世界坐标。
+  var PATHS = ${safeJson(paths)};
+  var current = ${safeJson(defaultAnimation)};
+  // 允许用 URL 片段指定初始动画（#walk）：插件的界面用它做「切动画」按钮，
+  // 不必反复重载整个预览页。
+  var hashAnim = (location.hash || '').replace('#', '');
+  if (hashAnim && ANIMS.indexOf(hashAnim) >= 0) current = hashAnim;
+
+  var canvas = document.getElementById('cv');
+  var ctx = canvas.getContext('2d');
+  var images = {};
+  var loaded = 0;
+  var total = Object.keys(IMAGE_DATA).length;
+
+  var bones = {};
+  var boneList = [];
+  var slots = (SPINE.slots || []).slice();
+  var skin = (SPINE.skins && SPINE.skins[0] && SPINE.skins[0].attachments) || {};
+
+  // ── 骨骼树 ──────────────────────────────────────────────────────────
+  (SPINE.bones || []).forEach(function (b) {
+    bones[b.name] = {
+      name: b.name, parent: b.parent || null, children: [],
+      setupX: b.x || 0, setupY: b.y || 0, setupRot: b.rotation || 0, length: b.length || 0,
+      animX: 0, animY: 0, animRot: 0, worldX: 0, worldY: 0, worldRot: 0
+    };
+    boneList.push(bones[b.name]);
+  });
+  boneList.forEach(function (b) {
+    if (b.parent && bones[b.parent]) { b.parentBone = bones[b.parent]; bones[b.parent].children.push(b); }
+  });
+
+  function updateWorld(b) {
+    var lx = b.setupX + b.animX;
+    var ly = b.setupY + b.animY;
+    var lr = (b.setupRot + b.animRot) * Math.PI / 180;
+    if (!b.parentBone) { b.worldX = lx; b.worldY = ly; b.worldRot = lr; }
+    else {
+      var pr = b.parentBone.worldRot, c = Math.cos(pr), s = Math.sin(pr);
+      b.worldX = b.parentBone.worldX + lx * c - ly * s;
+      b.worldY = b.parentBone.worldY + lx * s + ly * c;
+      b.worldRot = pr + lr;
+    }
+    for (var i = 0; i < b.children.length; i++) updateWorld(b.children[i]);
+  }
+
+  // ── IK 约束（两骨余弦定理） ──────────────────────────────────────────
+  //
+  // Spine 的 ik 里，bones 是「从根到末端」的骨骼名，target 是目标骨。
+  // **只解最后两根**：三骨以上的 IK 需要另一套解法（解析解或 FABRIK），
+  // 不是「多迭代几遍」就能对的——宁可不做，也不要给一个看起来能动、
+  // 实际姿势错的结果。
+  var IKS = (SPINE.ik || []).filter(function (c) { return c && c.bones && c.bones.length >= 2; });
+
+  function shortestAngle(from, to) {
+    var d = to - from;
+    while (d > Math.PI) d -= Math.PI * 2;
+    while (d < -Math.PI) d += Math.PI * 2;
+    return d;
+  }
+
+  function solveIk() {
+    for (var i = 0; i < IKS.length; i++) {
+      var c = IKS[i];
+      var chain = c.bones;
+      var child = bones[chain[chain.length - 1]];
+      var parent = bones[chain[chain.length - 2]];
+      var target = bones[c.target];
+      if (!child || !parent || !target) continue;
+      // **第一段长度与方向都按「子骨原点在父骨局部系里的实际位置」算**，不用 parent.length。
+      //
+      // IK 的经典推导假设链上骨骼首尾相接（子骨原点落在父骨的局部 +x，即骨尖）。
+      // 而我们的骨骼原点取的是**部件近端锚点**，部件摆得不够首尾相接时这个假设就破了：
+      // 实测举起的右臂两段被摆在同一小块区域，实际间距 41.9px、而上臂长度 140px；
+      // 更关键的是子骨原点在父骨局部系的**方向**（-160°）与父骨朝向（+90°）差了 250°。
+      // 只把长度改对、方向还按父骨朝向算，解出来的角度依然不满足几何（骨尖离目标 208px）。
+      //
+      // 父骨旋转不改变这个局部偏移，所以它稳定等于绑定姿势下的值。
+      var l1 = Math.sqrt(child.setupX * child.setupX + child.setupY * child.setupY);
+      // 子骨原点在父骨局部系里的方向角；父骨旋转 θ 时，它的世界方向 = θ + phi。
+      var phi = Math.atan2(child.setupY, child.setupX);
+      var l2 = child.length;
+      if (l1 <= 0.01 || l2 <= 0.01) continue;
+      var dx = target.worldX - parent.worldX;
+      var dy = target.worldY - parent.worldY;
+      var dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 1e-6) continue;
+      // 够不到就伸直、太近就折到极限：夹进 [|l1-l2|, l1+l2]，
+      // 否则 acos 的参数会跑出 [-1,1]，NaN 顺着矩阵扩散、整只骨架消失。
+      var d = Math.min(l1 + l2 - 1e-4, Math.max(Math.abs(l1 - l2) + 1e-4, dist));
+      var base = Math.atan2(dy, dx);
+      var cosA = (l1 * l1 + d * d - l2 * l2) / (2 * l1 * d);
+      var cosB = (l1 * l1 + l2 * l2 - d * d) / (2 * l1 * l2);
+      var a = Math.acos(Math.max(-1, Math.min(1, cosA)));
+      var b = Math.acos(Math.max(-1, Math.min(1, cosB)));
+      // bendPositive 决定取哪一支解（肘/膝往哪边弯）。
+      var sign = c.bendPositive === false ? -1 : 1;
+      var mix = typeof c.mix === 'number' ? Math.max(0, Math.min(1, c.mix)) : 1;
+      var pOrig = parent.worldRot, cOrig = child.worldRot;
+      // 两骨余弦定理的直接结论：
+      //   父骨那一段的朝向 = base − a
+      //   子骨的朝向       = **父骨朝向 + (π − b)**
+      // 子骨那一项必须相对**父骨朝向**算，不能相对 base——P1 并不在 P0→target 的
+      // 直线上，两者差一个 a。写错这一项的表现是「IK 看起来转了、但骨尖就是不到目标」
+      // （实测差了整整 91°）。
+      var pTheta = base - a * sign;
+      var cTheta = pTheta + (Math.PI - b) * sign;
+      // Spine 骨骼沿局部 +x 生长，子骨朝向就是世界旋转。
+      // 父骨那一段用的是「子骨原点方向」（θ + phi），所以仍减 phi。
+      var pWant = pTheta - phi;
+      var cWant = cTheta;
+      // 软 IK：在「不约束」与「对齐目标」之间按最短角差插值。
+      var pNew = pOrig + shortestAngle(pOrig, pWant) * mix;
+      var cNew = cOrig + shortestAngle(cOrig, cWant) * mix;
+      var pBase = parent.parentBone ? parent.parentBone.worldRot : 0;
+      parent.animRot = pNew * 180 / Math.PI - parent.setupRot - pBase * 180 / Math.PI;
+      child.animRot = cNew * 180 / Math.PI - child.setupRot - pNew * 180 / Math.PI;
+      // 后面的约束可能与这条链共享骨骼，必须读到前一条约束已经生效的矩阵。
+      updateWorld(parent);
+    }
+  }
+
+  // ── 贝塞尔（绝对控制点，4.2 语义） ──────────────────────────────────
+  // c = [cx1, cy1, cx2, cy2]，控制点与 time / value 同单位。
+  function bezierValue(c, t0, v0, t1, v1, t) {
+    if (!c || c.length < 4) {
+      var lin = (t1 - t0) > 1e-9 ? (t - t0) / (t1 - t0) : 0;
+      return v0 + (v1 - v0) * lin;
+    }
+    var x1 = c[0], y1 = c[1], x2 = c[2], y2 = c[3];
+    var lo = 0, hi = 1, u = 0.5;
+    for (var i = 0; i < 24; i++) {
+      u = (lo + hi) / 2;
+      var mu = 1 - u;
+      var x = mu * mu * mu * t0 + 3 * mu * mu * u * x1 + 3 * mu * u * u * x2 + u * u * u * t1;
+      if (x < t) lo = u; else hi = u;
+    }
+    var v = 1 - u;
+    return v * v * v * v0 + 3 * v * v * u * y1 + 3 * v * u * u * y2 + u * u * u * v1;
+  }
+
+  function sampleTrack(frames, t, kind) {
+    if (!frames || !frames.length) return null;
+    if (frames.length === 1) return frames[0];
+    // 末帧之外保持末帧值；时长等于末帧时间时由外层取模，循环自然闭合。
+    if (t <= frames[0].time) return frames[0];
+    if (t >= frames[frames.length - 1].time) return frames[frames.length - 1];
+    for (var i = 0; i < frames.length - 1; i++) {
+      var a = frames[i], b = frames[i + 1];
+      if (t >= a.time && t <= b.time) {
+        if (a.curve === 'stepped') return a;
+        if (kind === 'rotate') {
+          return { value: bezierValue(a.curve, a.time, a.value || 0, b.time, b.value || 0, t) };
+        }
+        var cx = a.curve && a.curve.length >= 8 ? a.curve.slice(0, 4) : null;
+        var cy = a.curve && a.curve.length >= 8 ? a.curve.slice(4, 8) : null;
+        return {
+          x: bezierValue(cx, a.time, a.x || 0, b.time, b.x || 0, t),
+          y: bezierValue(cy, a.time, a.y || 0, b.time, b.y || 0, t)
+        };
+      }
+    }
+    return frames[frames.length - 1];
+  }
+
+  function durationOf(anim) {
+    var max = 0.0001;
+    var b = anim.bones || {};
+    Object.keys(b).forEach(function (name) {
+      Object.keys(b[name]).forEach(function (kind) {
+        (b[name][kind] || []).forEach(function (f) { if (f.time > max) max = f.time; });
+      });
+    });
+    Object.values(anim.attachments || {}).forEach(function (skinTracks) {
+      Object.values(skinTracks).forEach(function (slotTracks) {
+        Object.values(slotTracks).forEach(function (attachmentTracks) {
+          (attachmentTracks.deform || []).forEach(function (f) { if (f.time > max) max = f.time; });
+        });
+      });
+    });
+    return max;
+  }
+
+  function applyAnimation(t) {
+    boneList.forEach(function (b) { b.animX = 0; b.animY = 0; b.animRot = 0; });
+    var anim = SPINE.animations && SPINE.animations[current];
+    if (anim) {
+      var tracks = anim.bones || {};
+      Object.keys(tracks).forEach(function (name) {
+        var bone = bones[name];
+        if (!bone) return;
+        var tl = tracks[name];
+        if (tl.rotate) { var r = sampleTrack(tl.rotate, t, 'rotate'); bone.animRot = (r && r.value) || 0; }
+        if (tl.translate) { var v = sampleTrack(tl.translate, t, 'translate'); bone.animX = (v && v.x) || 0; bone.animY = (v && v.y) || 0; }
+      });
+    }
+    // 拖动过的 IK 目标点覆盖动画值：**拖动是用户的即时意图**，不该被动画轨道盖掉
+    // （目标骨一般没有自己的轨道，但「手被动画驱动、目标点没动」时必须以手为准）。
+    boneList.forEach(function (b) {
+      if (b.dragX === undefined) return;
+      b.animX = b.dragX - b.setupX;
+      b.animY = b.dragY - b.setupY;
+    });
+  }
+
+  // ── 蒙皮网格 + FFD 变形（M5 的 L1 / L3）─────────────────────────────
+  //
+  // 有网格的部件走「逐三角形裁剪绘制」，没有的仍是一整块 drawImage。
+  // 分流的判据是 att.type === 'mesh'（骨架里写死的），不额外维护一张表。
+  //
+  // mesh 的非加权顶点是骨骼局部坐标；加权流里的每个影响也都是对应骨骼局部坐标。
+  // 不再重用 region 的挂点变换，按 Spine 同一份顶点/FFD/UV 数据绘制。
+
+  /**
+   * 当前时刻的顶点位移（FFD），直接采样导出的时间轴。
+   * 加权附件的每个骨骼影响都有独立的局部位移，不能把交错顶点流当坐标对。
+   */
+  function deformOffsetsOf(name, att, t) {
+    var anim = SPINE.animations && SPINE.animations[current];
+    var tracks = anim && anim.attachments && anim.attachments.default;
+    var attachmentTracks = tracks && tracks[name] && tracks[name][name];
+    var frames = attachmentTracks && attachmentTracks.deform;
+    if (!frames || frames.length === 0) return null;
+    var length = (att.uvs || []).length;
+    if ((att.vertices || []).length !== length) {
+      length = 0;
+      for (var cursor = 0; cursor < att.vertices.length;) {
+        var count = att.vertices[cursor++];
+        length += count * 2;
+        cursor += count * 4;
+      }
+    }
+    var a = frames[0], b = a;
+    if (t >= frames[frames.length - 1].time) a = b = frames[frames.length - 1];
+    else if (t > a.time) {
+      for (var i = 0; i + 1 < frames.length; i++) {
+        if (t >= frames[i].time && t <= frames[i + 1].time) { a = frames[i]; b = frames[i + 1]; break; }
+      }
+    }
+    var out = new Array(length);
+    for (var j = 0; j < length; j++) {
+      var av = (a.vertices || [])[j - (a.offset || 0)] || 0;
+      var bv = (b.vertices || [])[j - (b.offset || 0)] || 0;
+      out[j] = a === b || a.curve === 'stepped' ? av : bezierValue(a.curve, a.time, av, b.time, bv, t);
+    }
+    return out;
+  }
+
+  /** 三个源点（图片像素）→ 三个目标点（当前坐标系）的仿射矩阵。 */
+  function affineFromTriangles(s0, s1, s2, d0, d1, d2) {
+    var denom = (s1.x - s0.x) * (s2.y - s0.y) - (s2.x - s0.x) * (s1.y - s0.y);
+    if (Math.abs(denom) < 1e-9) return null;
+    var a = ((d1.x - d0.x) * (s2.y - s0.y) - (d2.x - d0.x) * (s1.y - s0.y)) / denom;
+    var b = ((d1.y - d0.y) * (s2.y - s0.y) - (d2.y - d0.y) * (s1.y - s0.y)) / denom;
+    var c = ((d2.x - d0.x) * (s1.x - s0.x) - (d1.x - d0.x) * (s2.x - s0.x)) / denom;
+    var d = ((d2.y - d0.y) * (s1.x - s0.x) - (d1.y - d0.y) * (s2.x - s0.x)) / denom;
+    return { a: a, b: b, c: c, d: d, e: d0.x - a * s0.x - c * s0.y, f: d0.y - b * s0.x - d * s0.y };
+  }
+
+  /**
+   * 把附件顶点解成当前的世界坐标，和官方 VertexAttachment.computeWorldVertices 一致。
+   *
+   * 两种格式要分开处理，而它们只能靠**长度**区分：
+   *  - 非加权：vertices 是所属骨骼局部坐标（长度等于 uvs）；
+   *  - 加权（LBS）：Spine 的交错流 [骨骼数, (骨骼下标, x, y, 权重) × 骨骼数, …]，
+   *    x/y 是**骨骼局部**坐标，得先用各骨骼的**当前**世界变换做线性混合，
+   *    然后按权重线性混合。
+   *
+   * 不分开的后果不是报错，是**画出一团乱线**：骨骼下标会被当成坐标用。
+   */
+  function meshWorldVertices(att, bone, offsets) {
+    const raw = att.vertices || [];
+    const uvs = att.uvs || [];
+    if (raw.length === 0) return [];
+    const out = [];
+    if (raw.length === uvs.length) {
+      for (let i = 0; i < raw.length; i += 2) {
+        const x = raw[i] + (offsets ? offsets[i] : 0);
+        const y = raw[i + 1] + (offsets ? offsets[i + 1] : 0);
+        out.push(bone.worldX + Math.cos(bone.worldRot) * x - Math.sin(bone.worldRot) * y,
+          bone.worldY + Math.sin(bone.worldRot) * x + Math.cos(bone.worldRot) * y);
+      }
+      return out;
+    }
+    let cursor = 0;
+    let deformCursor = 0;
+    while (cursor < raw.length) {
+      const count = raw[cursor++];
+      let wx = 0;
+      let wy = 0;
+      for (let n = 0; n < count; n++) {
+        const index = raw[cursor++];
+        const x = raw[cursor++] + (offsets ? offsets[deformCursor] : 0);
+        const y = raw[cursor++] + (offsets ? offsets[deformCursor + 1] : 0);
+        deformCursor += 2;
+        const weight = raw[cursor++];
+        const owner = bones[(SPINE.bones || [])[index]?.name];
+        if (!owner) continue;
+        wx += (Math.cos(owner.worldRot) * x - Math.sin(owner.worldRot) * y + owner.worldX) * weight;
+        wy += (Math.sin(owner.worldRot) * x + Math.cos(owner.worldRot) * y + owner.worldY) * weight;
+      }
+      out.push(wx, wy);
+    }
+    return out;
+  }
+
+  function drawMesh(bone, att, img, name, t) {
+    var offsets = deformOffsetsOf(name, att, t);
+    const verts = meshWorldVertices(att, bone, offsets);
+    const uvs = att.uvs || [];
+    const tris = att.triangles || [];
+    if (verts.length === 0 || tris.length === 0) return;   // 加权流已在上一步解码成坐标
+    var width = att.width || 1;
+    var height = att.height || 1;
+    ctx.save();
+    for (var k = 0; k + 2 < tris.length; k += 3) {
+      var i0 = tris[k] * 2, i1 = tris[k + 1] * 2, i2 = tris[k + 2] * 2;
+      var p0 = { x: verts[i0], y: verts[i0 + 1] };
+      var p1 = { x: verts[i1], y: verts[i1 + 1] };
+      var p2 = { x: verts[i2], y: verts[i2 + 1] };
+      // UV 决定固定的源像素；动画只能改目标顶点，不能跟着改纹理采样位置。
+      var s0 = { x: uvs[i0] * img.naturalWidth, y: uvs[i0 + 1] * img.naturalHeight };
+      var s1 = { x: uvs[i1] * img.naturalWidth, y: uvs[i1 + 1] * img.naturalHeight };
+      var s2 = { x: uvs[i2] * img.naturalWidth, y: uvs[i2 + 1] * img.naturalHeight };
+      var m = affineFromTriangles(s0, s1, s2, p0, p1, p2);
+      if (m === null) continue;
+      // 三个顶点以重心为中心**外扩一点点**。
+      //
+      // 逐三角形 clip 之后，每条边的抗锯齿像素都是半透明的，相邻三角形拼起来
+      // 就会在共享边上留下一条亮白细线（实测裙子上能看出一整张网格）。外扩之后
+      // 三角形彼此重叠，细线被后画的三角形盖掉。源点不跟着扩——那会让纹理整体
+      // 放大一圈；这里只挪目标点，代价是每边约 0.5px 的轻微拉伸，看不出来。
+      var gx = (p0.x + p1.x + p2.x) / 3;
+      var gy = (p0.y + p1.y + p2.y) / 3;
+      var grow = 1 + 1.2 / Math.max(1, Math.min(width, height) * view.scale);
+      p0 = { x: gx + (p0.x - gx) * grow, y: gy + (p0.y - gy) * grow };
+      p1 = { x: gx + (p1.x - gx) * grow, y: gy + (p1.y - gy) * grow };
+      p2 = { x: gx + (p2.x - gx) * grow, y: gy + (p2.y - gy) * grow };
+      ctx.save();
+      ctx.beginPath();
+      ctx.moveTo(p0.x, p0.y);
+      ctx.lineTo(p1.x, p1.y);
+      ctx.lineTo(p2.x, p2.y);
+      ctx.closePath();
+      ctx.clip();
+      ctx.transform(m.a, m.b, m.c, m.d, m.e, m.f);
+      ctx.drawImage(img, 0, 0);
+      ctx.restore();
+    }
+    ctx.restore();
+  }
+
+  // ── Path 约束（M5）─────────────────────────────────────────────────
+  //
+  // 把一串骨骼沿一条折线**按弧长**铺开。用弧长而不是"按段索引"，是因为段长不等时
+  // 按索引分会让骨骼在长段上稀疏、短段上挤成一团。
+  //
+  // 与宿主 rigpath.ts 是同一套公式（那边是 TS、这边是内联的经典脚本，无法共享模块），
+  // 所以两边的形状必须保持一样；差别只在宿主多做了「图像坐标 → 骨骼世界坐标」那一步。
+
+  function pathSegmentLengths(path) {
+    var count = path.points.length / 2;
+    var total = path.closed === true ? count : count - 1;
+    var out = [];
+    for (var i = 0; i < total; i++) {
+      var j = (i + 1) % count;
+      var dx = path.points[j * 2] - path.points[i * 2];
+      var dy = path.points[j * 2 + 1] - path.points[i * 2 + 1];
+      out.push(Math.sqrt(dx * dx + dy * dy));
+    }
+    return out;
+  }
+
+  function samplePath(path, lengths, total, distance) {
+    var count = path.points.length / 2;
+    if (total <= 1e-6) return { x: path.points[0], y: path.points[1], angle: 0 };
+    var lastSegment = lengths.length - 1;
+    while (lastSegment >= 0 && lengths[lastSegment] <= 1e-6) lastSegment--;
+    // 与官方 PathConstraint 相同：闭合路径循环，开放路径沿首尾切线外推。
+    var remaining = path.closed && total > 1e-9 ? ((distance % total) + total) % total : distance;
+    for (var i = 0; i < lengths.length; i++) {
+      var length = lengths[i];
+      // 导出的三次曲线路径移除了相邻重复点；预览也跳过对应的零长度段。
+      if (length <= 1e-6) continue;
+      if (remaining <= length || i === lastSegment) {
+        var t = length > 1e-9 ? remaining / length : 0;
+        var j = (i + 1) % count;
+        var x0 = path.points[i * 2], y0 = path.points[i * 2 + 1];
+        var x1 = path.points[j * 2], y1 = path.points[j * 2 + 1];
+        return { x: x0 + (x1 - x0) * t, y: y0 + (y1 - y0) * t, angle: Math.atan2(y1 - y0, x1 - x0) };
+      }
+      remaining -= length;
+    }
+    return { x: path.points[0], y: path.points[1], angle: 0 };
+  }
+
+  /** 把一根骨搬到一个目标世界位置/朝向上（local = setup + anim，就近插值到目标）。 */
+  function placeBone(bone, targetX, targetY, targetRot, translateMix, rotateMix) {
+    var parent = bone.parentBone;
+    var px = parent ? parent.worldX : 0;
+    var py = parent ? parent.worldY : 0;
+    var pr = parent ? parent.worldRot : 0;
+    var dx = targetX - px, dy = targetY - py;
+    var c = Math.cos(-pr), s = Math.sin(-pr);
+    var wantX = dx * c - dy * s;
+    var wantY = dx * s + dy * c;
+    var wantRot = targetRot - pr;
+    var haveX = bone.setupX + bone.animX;
+    var haveY = bone.setupY + bone.animY;
+    var haveRot = (bone.setupRot + bone.animRot) * Math.PI / 180;
+    var mixT = typeof translateMix === 'number' ? translateMix : 1;
+    var mixR = typeof rotateMix === 'number' ? rotateMix : 1;
+    var nextX = haveX + (wantX - haveX) * mixT;
+    var nextY = haveY + (wantY - haveY) * mixT;
+    // 角度按**最短差**插值：不然「-179° → 179°」会绕一大圈。
+    var delta = wantRot - haveRot;
+    while (delta > Math.PI) delta -= Math.PI * 2;
+    while (delta < -Math.PI) delta += Math.PI * 2;
+    var nextRot = haveRot + delta * mixR;
+    bone.animX = nextX - bone.setupX;
+    bone.animY = nextY - bone.setupY;
+    bone.animRot = nextRot * 180 / Math.PI - bone.setupRot;
+  }
+
+  function solvePaths() {
+    for (var name in PATHS) {
+      var spec = PATHS[name];
+      var chain = spec.bones || [];
+      if (chain.length === 0) continue;
+      var lengths = pathSegmentLengths(spec);
+      var total = 0;
+      for (var i = 0; i < lengths.length; i++) total += lengths[i];
+      if (total <= 1e-6) continue;
+      var spacing = spec.spacing > 0 ? spec.spacing : total / Math.max(1, chain.length - 1);
+      for (var k = 0; k < chain.length; k++) {
+        var bone = bones[chain[k]];
+        if (!bone) continue;
+        var at = samplePath(spec, lengths, total, k * spacing);
+        // Spine 的骨尖沿局部 +x，路径切线角可以直接作为世界旋转。
+        placeBone(bone, at.x, at.y, at.angle, spec.translateMix, spec.rotateMix);
+        // **放好一根就立刻刷新它的世界变换**：placeBone 是拿父级的当前世界位置
+        // 反算 local 的，而链上下一根骨的父级正是刚放好的这根——不刷新的话它读到的
+        // 还是旧位置，误差会沿着链累积（实测三根骨的末端偏了 39px）。
+        updateWorld(bone);
+      }
+    }
+  }
+
+  // ── 视图 ────────────────────────────────────────────────────────────
+  var view = { scale: 1, cx: 0, cy: 0 };
+  function fitView() {
+    var w = SPINE.skeleton.width || 512, h = SPINE.skeleton.height || 512;
+    var box = { minX: -w / 2, maxX: w / 2, minY: 0, maxY: h };
+    slots.forEach(function (slot) {
+      var att = skin[slot.name] && skin[slot.name][slot.attachment];
+      var bone = bones[slot.bone];
+      if (!att || !bone) return;
+      var rad = ((att.rotation || 0) * Math.PI / 180);
+      var hw = att.width / 2, hh = att.height / 2;
+      for (var sx = -1; sx <= 1; sx += 2) for (var sy = -1; sy <= 1; sy += 2) {
+        var lx = att.x + (sx * hw * Math.cos(rad) - sy * hh * Math.sin(rad));
+        var ly = att.y + (sx * hw * Math.sin(rad) + sy * hh * Math.cos(rad));
+        var pr = bone.worldRot, c = Math.cos(pr), s = Math.sin(pr);
+        var wx = bone.worldX + lx * c - ly * s;
+        var wy = bone.worldY + lx * s + ly * c;
+        if (wx < box.minX) box.minX = wx;
+        if (wx > box.maxX) box.maxX = wx;
+        if (wy < box.minY) box.minY = wy;
+        if (wy > box.maxY) box.maxY = wy;
+      }
+    });
+    var bw = Math.max(32, box.maxX - box.minX);
+    var bh = Math.max(32, box.maxY - box.minY);
+    var cw = Math.min(760, Math.max(300, Math.round(bw * 1.9)));
+    var ch = Math.round(cw * (bh / bw) * 1.12);
+    canvas.width = cw;
+    canvas.height = Math.min(820, Math.max(260, ch));
+    var margin = 26;
+    var sc = Math.min((canvas.width - margin * 2) / bw, (canvas.height - margin * 2) / bh);
+    view.scale = sc;
+    view.cx = canvas.width / 2 - ((box.minX + box.maxX) / 2) * sc;
+    view.cy = canvas.height / 2 + ((box.minY + box.maxY) / 2) * sc;
+  }
+
+  var showBones = false, showGrid = false;
+
+  function render(t) {
+    applyAnimation(t);
+    boneList.forEach(function (b) { if (!b.parentBone) updateWorld(b); });
+    // IK 要用**未约束**的姿态当基准（软 IK 的插值起点），所以先算一遍世界变换、
+    // 求解、再算一遍让约束结果生效。
+    solveIk();
+    boneList.forEach(function (b) { if (!b.parentBone) updateWorld(b); });
+    // Path 同理：它读父级的世界位置来反算 local，所以必须排在 updateWorld 之后；
+    // 链上父在前，就地算完即可，最后统一再刷一次世界变换。
+    solvePaths();
+    boneList.forEach(function (b) { if (!b.parentBone) updateWorld(b); });
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    if (showGrid) {
+      ctx.save();
+      ctx.strokeStyle = 'rgba(120,140,200,.18)';
+      ctx.lineWidth = 1;
+      for (var x = 0; x < canvas.width; x += 24) { ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke(); }
+      for (var y = 0; y < canvas.height; y += 24) { ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke(); }
+      ctx.restore();
+    }
+
+    ctx.save();
+    ctx.translate(view.cx, view.cy);
+    ctx.scale(view.scale, -view.scale);
+
+    slots.forEach(function (slot) {
+      var bone = bones[slot.bone];
+      if (!bone) return;
+      var atts = skin[slot.name];
+      if (!atts) return;
+      var att = atts[slot.attachment];
+      if (!att) return;
+      var img = images[slot.name];
+      if (!img || !img.complete || !img.naturalWidth) return;
+      if (att.type === 'mesh') { drawMesh(bone, att, img, slot.name, t); return; }
+      ctx.save();
+      ctx.translate(bone.worldX, bone.worldY);
+      ctx.rotate(bone.worldRot);
+      ctx.translate(att.x || 0, att.y || 0);
+      ctx.rotate((att.rotation || 0) * Math.PI / 180);
+      ctx.scale(1, -1);
+      ctx.drawImage(img, -(att.width / 2), -(att.height / 2), att.width, att.height);
+      ctx.restore();
+    });
+
+    if (showBones) {
+      boneList.forEach(function (b) {
+        ctx.save();
+        ctx.translate(b.worldX, b.worldY);
+        ctx.rotate(b.worldRot);
+        if (b.length > 0) {
+          ctx.beginPath();
+          ctx.moveTo(0, 0);
+          ctx.lineTo(b.length, 0);
+          ctx.strokeStyle = 'rgba(80,230,140,.85)';
+          ctx.lineWidth = 1.6 / view.scale;
+          ctx.stroke();
+        }
+        ctx.beginPath();
+        ctx.arc(0, 0, 3.2 / view.scale, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(255,90,90,.95)';
+        ctx.fill();
+        ctx.restore();
+        ctx.save();
+        ctx.translate(b.worldX, b.worldY);
+        ctx.scale(1, -1);
+        ctx.fillStyle = 'rgba(255,255,255,.62)';
+        ctx.font = (9 / view.scale) + 'px sans-serif';
+        ctx.fillText(b.name, 5 / view.scale, -3 / view.scale);
+        ctx.restore();
+      });
+    }
+
+    // IK 目标点：画成显眼的菱形——它是**可拖的**，也就是验收判据里那个「目标点」。
+    IKS.forEach(function (c) {
+      var t = bones[c.target];
+      if (!t) return;
+      ctx.save();
+      ctx.translate(t.worldX, t.worldY);
+      ctx.scale(1, -1); // 抵消全局的 y 翻转，形状才是正立的
+      var r = 6 / view.scale;
+      ctx.beginPath();
+      ctx.moveTo(0, -r); ctx.lineTo(r, 0); ctx.lineTo(0, r); ctx.lineTo(-r, 0);
+      ctx.closePath();
+      ctx.fillStyle = 'rgba(90,220,255,.92)';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(16,58,88,.95)';
+      ctx.lineWidth = 1.2 / view.scale;
+      ctx.stroke();
+      ctx.restore();
+    });
+
+    ctx.restore();
+  }
+
+  // ── 播放控制 ────────────────────────────────────────────────────────
+  var playing = true, animTime = 0, last = 0, scrubLock = false;
+  var scrub = document.getElementById('scrub');
+  var tip = document.getElementById('tip');
+
+  function duration() {
+    var anim = SPINE.animations && SPINE.animations[current];
+    return anim ? durationOf(anim) : 1;
+  }
+
+  function tick(ts) {
+    if (!last) last = ts;
+    var dt = Math.min(0.05, (ts - last) / 1000);
+    last = ts;
+    var dur = duration();
+    if (playing) {
+      animTime = (animTime + dt) % dur;
+      if (!scrubLock) scrub.value = String(Math.round((animTime / dur) * 1000));
+    }
+    render(animTime);
+    requestAnimationFrame(tick);
+  }
+
+  function updateTip() {
+    var anim = SPINE.animations && SPINE.animations[current];
+    if (!anim) { tip.textContent = '（没有动画数据）'; return; }
+    var count = Object.keys(anim.bones || {}).length;
+    tip.textContent = '时长 ' + durationOf(anim).toFixed(2) + ' 秒 · 驱动 ' + count + ' 根骨骼 · 共 ' + ANIMS.length + ' 个动作';
+  }
+
+  Object.entries(IMAGE_DATA).forEach(function (entry) {
+    var img = new Image();
+    img.onload = img.onerror = function () {
+      loaded++;
+      if (loaded === total) { fitView(); updateTip(); requestAnimationFrame(tick); }
+    };
+    img.src = entry[1];
+    images[entry[0]] = img;
+  });
+  if (total === 0) { fitView(); updateTip(); requestAnimationFrame(tick); }
+
+  var box = document.getElementById('anims');
+  ANIMS.forEach(function (name) {
+    var btn = document.createElement('button');
+    btn.textContent = name;
+    if (name === current) btn.className = 'active';
+    btn.onclick = function () {
+      current = name;
+      animTime = 0;
+      Array.prototype.forEach.call(box.children, function (c) { c.className = ''; });
+      btn.className = 'active';
+      updateTip();
+    };
+    box.appendChild(btn);
+  });
+
+  document.getElementById('play').onclick = function () {
+    playing = !playing;
+    this.textContent = playing ? '⏸ 暂停' : '▶ 播放';
+  };
+  document.getElementById('bones').onclick = function () {
+    showBones = !showBones;
+    this.className = showBones ? 'active' : '';
+  };
+  document.getElementById('grid').onclick = function () {
+    showGrid = !showGrid;
+    this.className = showGrid ? 'active' : '';
+  };
+  scrub.addEventListener('input', function () {
+    animTime = duration() * (Number(this.value) / 1000);
+  });
+  scrub.addEventListener('pointerdown', function () { scrubLock = true; });
+  scrub.addEventListener('pointerup', function () { scrubLock = false; });
+  // ── 拖动 IK 目标点 ──────────────────────────────────────────────────
+  //
+  // 验收判据就是这一条：「把一只手约束到目标点，拖动目标点时手跟随」。
+  // 所以预览页必须能直接拖——只能去编辑器里改数字的话，这条判据等于没验。
+  var draggingTarget = null;
+  function toWorldPoint(event) {
+    var rect = canvas.getBoundingClientRect();
+    var sx = (event.clientX - rect.left) * (canvas.width / Math.max(1, rect.width));
+    var sy = (event.clientY - rect.top) * (canvas.height / Math.max(1, rect.height));
+    // 与 render 里的变换严格互逆：屏幕 = (cx + wx·s, cy − wy·s)
+    return { x: (sx - view.cx) / view.scale, y: (view.cy - sy) / view.scale };
+  }
+  canvas.addEventListener('mousedown', function (event) {
+    if (IKS.length === 0) return;
+    var point = toWorldPoint(event);
+    var best = null;
+    var bestDist = 26 / view.scale;
+    IKS.forEach(function (c) {
+      var t = bones[c.target];
+      if (!t) return;
+      var d = Math.sqrt(Math.pow(t.worldX - point.x, 2) + Math.pow(t.worldY - point.y, 2));
+      if (d < bestDist) { bestDist = d; best = t; }
+    });
+    if (best !== null) {
+      draggingTarget = best;
+      canvas.style.cursor = 'grabbing';
+      event.preventDefault();
+    }
+  });
+  window.addEventListener('mousemove', function (event) {
+    if (draggingTarget === null) return;
+    var point = toWorldPoint(event);
+    draggingTarget.dragX = point.x;
+    draggingTarget.dragY = point.y;
+    event.preventDefault();
+  });
+  window.addEventListener('mouseup', function () {
+    if (draggingTarget === null) return;
+    draggingTarget = null;
+    canvas.style.cursor = '';
+  });
+
+  // 只读验收钩子：自动化测试要能问「链末端的骨尖现在在哪」，
+  // 否则「拖动目标点时手跟随」这条判据只能靠肉眼看截图。
+  // 只暴露读接口，不提供任何写入口——验收用的东西不该能改状态。
+  window.__gmmPreview = {
+    /** 当前 mesh 世界顶点，供验收比较官方运行时，不改变播放状态。 */
+    meshVertices: function (name) {
+      var slot = slots.find(function (item) { return item.name === name; });
+      var att = slot && skin[name] && skin[name][slot.attachment];
+      var bone = slot && bones[slot.bone];
+      if (!att || att.type !== 'mesh' || !bone) return null;
+      return meshWorldVertices(att, bone, deformOffsetsOf(name, att, animTime));
+    },
+    bones: function () {
+      var out = {};
+      boneList.forEach(function (b) {
+        out[b.name] = { x: b.worldX, y: b.worldY, rot: b.worldRot, length: b.length };
+      });
+      return out;
+    },
+    iks: function () {
+      return IKS.map(function (c) { return { name: c.name, target: c.target, bones: c.bones.slice(), mix: c.mix }; });
+    },
+    /** 骨骼在 canvas 里的像素坐标（拖动验收要用它算出鼠标该落在哪）。 */
+    screen: function (name) {
+      var b = bones[name];
+      if (!b) return null;
+      return { x: view.cx + b.worldX * view.scale, y: view.cy - b.worldY * view.scale };
+    },
+    /** 链末端的**骨尖**世界坐标——它应该落在目标点上。 */
+    tip: function (constraintName) {
+      for (var i = 0; i < IKS.length; i++) {
+        if (constraintName !== undefined && IKS[i].name !== constraintName) continue;
+        var chain = IKS[i].bones;
+        var last = bones[chain[chain.length - 1]];
+        if (!last) continue;
+        return { x: last.worldX + Math.cos(last.worldRot) * last.length, y: last.worldY + Math.sin(last.worldRot) * last.length };
+      }
+      return null;
+    }
+  };
+
+  window.addEventListener('resize', function () { fitView(); render(animTime); });
+})();
+</script>
+</body>
+</html>
+`;
+}
+function escapeHtml(value) {
+    return value.replace(/[&<>"']/g, (char) => char === "&" ? "&amp;" : char === "<" ? "&lt;" : char === ">" ? "&gt;" : char === '"' ? "&quot;" : "&#39;");
+}

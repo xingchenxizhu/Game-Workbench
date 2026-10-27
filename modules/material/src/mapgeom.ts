@@ -1,0 +1,396 @@
+/**
+ * 地图编辑器（模块六）的**网格内核**：纯函数、不碰磁盘、不碰网络。
+ *
+ * 只有一种格网：正方形俯视（16×16 / 32×32 那种）。等距那一套随旧流水线一起删掉，
+ * 「格网类型」这个字段也就不存在了 —— 留着它只会在别的模块里又长出一层分支。
+ *
+ * ## 为什么把它单独抽一层
+ *
+ * 旧模块（`tilegeom.ts` / `tilemap.ts`）的坐标口径散在三处，界面还要复刻一份，
+ * 于是「保存后整体抬高」「点到的格子不是涂到的格子」反复出现。这个模块是
+ * 新模块**唯一的坐标真源**：宿主渲染、导出、chunk 划分、命中测试全走这里；
+ * 浏览器半区**只被允许**复刻 `pointToCell` / `cellAnchor` / `cellTopLeft`
+ * （`verify-map-client.mjs` 拿本文件的真实现做黄金对照钉住）。
+ *
+ * ## 环绕（关键，改错了只会静默错位）
+ *
+ * 地图是**环面**：格坐标允许为负、允许 ≥ rows/cols，取模由 `wrapRow` / `wrapCol`
+ * 负责；像素位置则**按线性公式照算**。于是同一格内容可以在屏幕上出现多次 ——
+ * 左右边界靠上一行的那一块，就是「图外多画的一份」。AsLib 同款，用户不必关心边界。
+ * 两个静默坑：
+ *
+ *   · 计划里的 `r` / `c` 用**规范坐标**（取模后 0..rows/cols−1），但 `x` / `y` 是
+ *     **绝对像素**（可以越界）。两边只取模一边，内容就画到屏幕外了 —— 不报错，
+ *     只是「看着是空的」。
+ *   · 视口覆盖范围（`viewCellRange`）在环绕下**每一维最多铺一整轮**。放开这个限制
+ *     内容不会错，只会全是重复，而且把绘制计划撑爆。
+ *
+ * 格子的「锚点」= 单元格底边中点（贴图按底边中点对齐锚点落地）。需要中心时调
+ * `cellCenter()`：**别把锚点当中心** —— 跨格贴图曾经因此整体偏半格，真机表现是
+ * 「房子浮在半空」。
+ */
+
+/** 一份格网：只有正方格与「要不要环绕」。 */
+export interface MapGrid {
+  /** 单元格宽，像素。 */
+  tileWidth: number;
+  /** 单元格高，像素；与 `tileWidth` 不等就是长方形网格（允许）。 */
+  tileHeight: number;
+  /** 环绕：越界坐标取模回到图内（默认开，AsLib 同款）。 */
+  wrap: boolean;
+}
+
+export const DEFAULT_GRID: MapGrid = { tileWidth: 32, tileHeight: 32, wrap: true };
+
+/** 单边最大格数。超过就明确拒绝，而不是把进程 OOM 掉。 */
+export const MAX_MAP_DIM = 512;
+/** 单张地图最大格数（与逐边上限一致）。 */
+export const MAX_MAP_CELLS = MAX_MAP_DIM * MAX_MAP_DIM;
+/**
+ * 渲染计划的块边长（格）。一次笔刷最多弄脏 4 块。
+ *
+ * ⚠️ **这个数字直接决定拖动时的开销**：改一格要重画的那一块会被整块作废并从宿主重发，
+ * 所以每批（40ms）重发的量 ≈ 「弄脏的块数（1~4）× 块边长² × 每格 op 数（A2 是 4）」。
+ *
+ * 取 32 时，新建的 32×32 项目**整张地图就是一块** —— 画一格要重发 4096 条 op，
+ * 真机量到宿主侧 4.6ms/批（加上写入约 6ms，按 40ms 一批约占单核 15%），地图再大更糟。
+ * 取 8 之后同样的场景最坏 4×64×4 = 1024 条（≈1/4），实测宿主侧约 1.1ms/批。
+ * 再往下取（4）收益递减、可见范围内的块数还翻倍（每次查询的 key 太多）。
+ *
+ * 协议两侧共用这一个常量，改它只影响缓存粒度，不影响落盘格式。
+ */
+export const MAP_CHUNK_SIZE = 8;
+
+/**
+ * 计划一次最多回多少块。
+ *
+ * 按**面积**折算：`MAX_PLAN_CHUNKS × MAP_CHUNK_SIZE²` 恒等于一张最大地图（512×512）。
+ * 换句话说「一次能覆盖多少格」不随块边长变 —— 块边长只是粒度，不该悄悄改变截断的门槛
+ * （否则调小块边长会让「缩小到最远」这一档突然开始截断并弹「缩得太小，放大一点。」）。
+ */
+export const MAX_PLAN_CHUNKS = Math.ceil((MAX_MAP_DIM * MAX_MAP_DIM) / (MAP_CHUNK_SIZE * MAP_CHUNK_SIZE));
+
+/**
+ * 把任意输入收敛成一份合法网格。缺项回落默认值；**形状不合法不修**，
+ * 交给 `assertGrid` 抛出可执行的原因（静默改成别的比例更难排查）。
+ */
+export function normalizeGrid(input: unknown): MapGrid {
+  const raw = (input ?? {}) as Record<string, unknown>;
+  const int = (value: unknown, fallback: number): number => {
+    const n = typeof value === "number" ? value : Number.parseFloat(String(value ?? ""));
+    return Number.isFinite(n) ? Math.round(n) : fallback;
+  };
+  return {
+    tileWidth: int(raw.tileWidth, DEFAULT_GRID.tileWidth),
+    tileHeight: int(raw.tileHeight, DEFAULT_GRID.tileHeight),
+    wrap: typeof raw.wrap === "boolean" ? raw.wrap : DEFAULT_GRID.wrap
+  };
+}
+
+/** 网格是否合法；不合法抛 `Error`（文案要能直接告诉用户改成什么）。 */
+export function assertGrid(grid: MapGrid): void {
+  for (const [label, value] of [["瓦片宽", grid.tileWidth], ["瓦片高", grid.tileHeight]] as const) {
+    if (!Number.isInteger(value) || value < 1 || value > 2048) {
+      throw new Error(`${label}必须是 1~2048 的整数，收到 ${String(value)}`);
+    }
+  }
+  if (typeof grid.wrap !== "boolean") throw new Error(`环绕开关必须是布尔值，收到 ${String(grid.wrap)}`);
+}
+
+export function assertMapSize(cols: number, rows: number): void {
+  if (!Number.isInteger(cols) || !Number.isInteger(rows) || cols < 1 || rows < 1) {
+    throw new Error(`地图尺寸必须是正整数，收到 ${cols}×${rows}`);
+  }
+  if (cols > MAX_MAP_DIM || rows > MAX_MAP_DIM) {
+    throw new Error(`地图单边最多 ${MAX_MAP_DIM} 格，收到 ${cols}×${rows}。请把格网调大或把地图改小。`);
+  }
+}
+
+/** 一份地图布局：把网格与尺寸解成可用的像素常量。 */
+export interface MapLayout {
+  grid: MapGrid;
+  cols: number;
+  rows: number;
+  /** 相邻格在 x / y 上的步长（= 瓦片宽 / 高）。 */
+  stepX: number;
+  stepY: number;
+  /** 网格脚印的像素尺寸；环绕下它也是横向 / 纵向的重复周期。 */
+  width: number;
+  height: number;
+  /** 环绕开关的副本，省得每处都写 `layout.grid.wrap`。 */
+  wrap: boolean;
+}
+
+export function layoutOf(grid: MapGrid, cols: number, rows: number): MapLayout {
+  assertGrid(grid);
+  assertMapSize(cols, rows);
+  return {
+    grid,
+    cols,
+    rows,
+    stepX: grid.tileWidth,
+    stepY: grid.tileHeight,
+    width: cols * grid.tileWidth,
+    height: rows * grid.tileHeight,
+    wrap: grid.wrap
+  };
+}
+
+// ── 环绕 ─────────────────────────────────────────────────────────────────
+
+/** 取模到 `0..size-1`（负数也对：JS 的 `%` 会给负余数）。 */
+function mod(value: number, size: number): number {
+  const rest = value % size;
+  return rest < 0 ? rest + size : rest;
+}
+
+/** 行坐标取模；不环绕时**原样返回**（越界就是越界，由调用方判断 inMap）。 */
+export function wrapRow(layout: MapLayout, r: number): number {
+  return layout.wrap ? mod(r, layout.rows) : r;
+}
+
+export function wrapCol(layout: MapLayout, c: number): number {
+  return layout.wrap ? mod(c, layout.cols) : c;
+}
+
+export function wrapCell(layout: MapLayout, r: number, c: number): { r: number; c: number } {
+  return { r: wrapRow(layout, r), c: wrapCol(layout, c) };
+}
+
+// ── 格子 ↔ 像素 ──────────────────────────────────────────────────────────
+
+/** 格子中心像素。 */
+export function cellCenter(layout: MapLayout, r: number, c: number): { x: number; y: number } {
+  return { x: c * layout.stepX + layout.grid.tileWidth / 2, y: r * layout.stepY + layout.grid.tileHeight / 2 };
+}
+
+/**
+ * 格子锚点 = 单元格**底边中点**（贴图锚点落地的那个像素点）。
+ * 越界坐标照样给出正确的线性位置 —— 环绕就是靠这一点把图外的副本摆出去的。
+ */
+export function cellAnchor(layout: MapLayout, r: number, c: number): { x: number; y: number } {
+  const center = cellCenter(layout, r, c);
+  return { x: center.x, y: (r + 1) * layout.stepY };
+}
+
+/**
+ * 一张贴图贴在某个格子上时，它的左上角在哪。
+ *
+ * `anchorX` / `anchorY` 是贴图内部的归一化锚点（默认底边中点）。贴图比一格大时
+ * （树、房子）只改 width/height 即可，锚点自动跟着走。
+ */
+export function cellTopLeft(
+  layout: MapLayout,
+  r: number,
+  c: number,
+  width: number,
+  height: number,
+  anchorX = 0.5,
+  anchorY = 1
+): { x: number; y: number } {
+  const anchor = cellAnchor(layout, r, c);
+  return { x: anchor.x - width * anchorX, y: anchor.y - height * anchorY };
+}
+
+export interface CellHit {
+  r: number;
+  c: number;
+  /** 是否落在 0..rows / 0..cols 内。环绕时见 `pointToCell`（恒 true）。 */
+  inMap: boolean;
+}
+
+/**
+ * 像素 → 格子，**不取模**。越界返回图外的负坐标 / 超界坐标，`inMap` 为 false。
+ *
+ * 环绕的取模由 `pointToCell` 做；`viewCellRange` 特意用这一版，因为「视口在图外的
+ * 哪一侧」必须靠越界坐标才看得出来。
+ */
+export function pointToCellRaw(layout: MapLayout, x: number, y: number): CellHit {
+  const c = Math.floor(x / layout.stepX);
+  const r = Math.floor(y / layout.stepY);
+  return { r, c, inMap: r >= 0 && c >= 0 && r < layout.rows && c < layout.cols };
+}
+
+/** 像素 → 格子。环绕时取模且 `inMap` **恒 true**（图外像素等价于图内对应位置）。 */
+export function pointToCell(layout: MapLayout, x: number, y: number): CellHit {
+  const raw = pointToCellRaw(layout, x, y);
+  if (!layout.wrap) return raw;
+  return { r: wrapRow(layout, raw.r), c: wrapCol(layout, raw.c), inMap: true };
+}
+
+/** 逐格遍历顺序 = 绘制顺序（行优先，等价于 Tiled 的 `renderorder: right-down`）。 */
+export function drawOrderRows(cols: number, rows: number): Array<[number, number]> {
+  const out: Array<[number, number]> = [];
+  for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) out.push([r, c]);
+  return out;
+}
+
+// ── chunk（绘制计划的分块单位）────────────────────────────────────────────
+
+export interface ChunkIndex {
+  cx: number;
+  cy: number;
+}
+
+export function chunkOf(r: number, c: number): ChunkIndex {
+  return { cx: Math.floor(c / MAP_CHUNK_SIZE), cy: Math.floor(r / MAP_CHUNK_SIZE) };
+}
+
+/** `"cx,cy"`；环绕下**可以是负的**（界面收到的 `have` 里就有）。 */
+export function chunkKey(chunk: ChunkIndex): string {
+  return `${chunk.cx},${chunk.cy}`;
+}
+
+/**
+ * 解析 chunk key。**必须严格**：`Number.parseInt("1.5")` 会得到 `1`，
+ * 于是客户端报上来的脏 key 会被当成另一个 chunk —— 增量缓存静默错一整块。
+ */
+export function parseChunkKey(key: string): ChunkIndex | undefined {
+  const matched = /^(-?\d+),(-?\d+)$/.exec(key);
+  if (matched === null) return undefined;
+  const cx = Number(matched[1]);
+  const cy = Number(matched[2]);
+  if (!Number.isSafeInteger(cx) || !Number.isSafeInteger(cy)) return undefined;
+  return { cx, cy };
+}
+
+/** 格子范围，**右下开区间**（`r1` / `c1` 不含）。 */
+export interface CellRange {
+  r0: number;
+  c0: number;
+  r1: number;
+  c1: number;
+}
+
+/** chunk 覆盖的格子范围，**不裁剪**（环绕下要能表示负的起点）。 */
+export function rangeOfChunk(chunk: ChunkIndex): CellRange {
+  return {
+    r0: chunk.cy * MAP_CHUNK_SIZE,
+    c0: chunk.cx * MAP_CHUNK_SIZE,
+    r1: (chunk.cy + 1) * MAP_CHUNK_SIZE,
+    c1: (chunk.cx + 1) * MAP_CHUNK_SIZE
+  };
+}
+
+/** 覆盖 `range` 的所有 chunk（原始坐标，可能越界；规范化交给 `canonicalChunk`）。 */
+export function chunksInRange(range: CellRange): ChunkIndex[] {
+  const out: ChunkIndex[] = [];
+  if (range.r1 <= range.r0 || range.c1 <= range.c0) return out;
+  const cx0 = Math.floor(range.c0 / MAP_CHUNK_SIZE);
+  const cx1 = Math.floor((range.c1 - 1) / MAP_CHUNK_SIZE);
+  const cy0 = Math.floor(range.r0 / MAP_CHUNK_SIZE);
+  const cy1 = Math.floor((range.r1 - 1) / MAP_CHUNK_SIZE);
+  for (let cy = cy0; cy <= cy1; cy++) {
+    for (let cx = cx0; cx <= cx1; cx++) out.push({ cx, cy });
+  }
+  return out;
+}
+
+/**
+ * 把 chunk 取模成 `0..nx-1` × `0..ny-1`（`nx = ceil(cols/32)`）。
+ *
+ * 客户端缓存与脏标记**只认规范 key**，否则同一块内容会以无数个越界 key 反复入缓存，
+ * 而且永远匹配不上脏标记 —— 表现是「涂了不刷新」，也不报错。
+ */
+export function canonicalChunk(chunk: ChunkIndex, cols: number, rows: number): ChunkIndex {
+  const nx = Math.max(1, Math.ceil(cols / MAP_CHUNK_SIZE));
+  const ny = Math.max(1, Math.ceil(rows / MAP_CHUNK_SIZE));
+  return { cx: mod(chunk.cx, nx), cy: mod(chunk.cy, ny) };
+}
+
+/** 整张地图的规范 chunk（导出 / 全量计划用）。 */
+export function allChunks(cols: number, rows: number): ChunkIndex[] {
+  const out: ChunkIndex[] = [];
+  const nx = Math.max(1, Math.ceil(cols / MAP_CHUNK_SIZE));
+  const ny = Math.max(1, Math.ceil(rows / MAP_CHUNK_SIZE));
+  for (let cy = 0; cy < ny; cy++) for (let cx = 0; cx < nx; cx++) out.push({ cx, cy });
+  return out;
+}
+
+/**
+ * 一批格子会弄脏哪些 chunk（返回**规范** key，可直接与客户端的 `have` 比对）。
+ *
+ * 范围取 3×3 邻域：自动连接会改邻近格的外观，而邻居可能在隔壁 chunk。环绕时
+ * `r = 0` 的上一行邻居是 `rows-1`，必须落到 `rows-1` 所在的 chunk —— 漏了这一步，
+ * 表现是「贴着上边界涂，另一边接缝不更新」，不报错。
+ */
+export function dirtyChunksFor(cells: Iterable<{ r: number; c: number }>, layout: MapLayout): string[] {
+  const keys = new Set<string>();
+  const push = (r: number, c: number): void => {
+    const cell = layout.wrap ? wrapCell(layout, r, c) : { r, c };
+    if (cell.r < 0 || cell.c < 0 || cell.r >= layout.rows || cell.c >= layout.cols) return;
+    keys.add(chunkKey(canonicalChunk(chunkOf(cell.r, cell.c), layout.cols, layout.rows)));
+  };
+  for (const cell of cells) {
+    for (let dr = -1; dr <= 1; dr++) for (let dc = -1; dc <= 1; dc++) push(cell.r + dr, cell.c + dc);
+  }
+  return [...keys].sort();
+}
+
+function clampInt(value: number, low: number, high: number): number {
+  return Math.max(low, Math.min(high, value));
+}
+
+/**
+ * 视口矩形覆盖到的格子范围（`padding` 默认 1：自动连接需要看一圈邻居）。
+ *
+ * 用 `pointToCellRaw` 的四角 —— 视口在图外时坐标是负的 / 超界的，正好能算出要
+ * 补画的图外副本。
+ *
+ * 环绕下**每一维最多铺一整轮**（`rows` / `cols`）：多出来的部分与前面完全重复，
+ * 画了也看不见，却会把 chunk 数与计划条数按倍数放大（`MAP_CHUNK_SIZE` 那一侧
+ * 还有 `MAX_PLAN_CHUNKS` 兜着，这里必须自己收口）。非环绕下裁到 `0..cols/rows`，
+ * 视口完全在图外时返回空 range（`r1 === r0`），`chunksInRange` 会给出空数组。
+ *
+ * ⚠️ **一整轮要取「地图自己那一轮」，不能从视口左上角起算**。
+ *
+ * 视口比地图还大时（画布大、地图只占左上角一片，相机被夹在 0），`padding` 会把
+ * 起点推到 `-1`：再一刀切在 `c0 + cols` 上，得到的其实是 `[-1, cols-1)` ——
+ * 地图自己的**最后一列**只以「视口左上角外侧的环绕副本」出现，而那一份落在画布
+ * 外面。真机表现：地图右边缘少一列、底边少一行；摆在那一列上的标记点直接看不见。
+ */
+export function viewCellRange(
+  layout: MapLayout,
+  view: { x: number; y: number; width: number; height: number },
+  padding = 1
+): CellRange {
+  const corners = [
+    { x: view.x, y: view.y },
+    { x: view.x + view.width, y: view.y },
+    { x: view.x, y: view.y + view.height },
+    { x: view.x + view.width, y: view.y + view.height }
+  ].map((point) => pointToCellRaw(layout, point.x, point.y));
+  const r0 = Math.min(...corners.map((hit) => hit.r)) - padding;
+  const c0 = Math.min(...corners.map((hit) => hit.c)) - padding;
+  const r1 = Math.max(...corners.map((hit) => hit.r)) + 1 + padding;
+  const c1 = Math.max(...corners.map((hit) => hit.c)) + 1 + padding;
+  if (!layout.wrap) {
+    return {
+      r0: clampInt(r0, 0, layout.rows),
+      c0: clampInt(c0, 0, layout.cols),
+      r1: clampInt(r1, 0, layout.rows),
+      c1: clampInt(c1, 0, layout.cols)
+    };
+  }
+  /**
+   * 环绕：视口某一维比地图还长 → 那一维**直接给整张地图**（`0..cols` / `0..rows`）。
+   *
+   * 取的是「地图自己那一轮」而不是「视口左上角起的一轮」：后者会被 padding 推成
+   * `[-padding, cols-padding)`，把地图最后几列挤出窗口（见上面的注释）。
+   * 收在一轮以内，所以条数仍然有界；自动连接要看的邻居在环绕下就在这一轮里。
+   */
+  const whole = (from: number, to: number, span: number): [number, number] => (to - from > span ? [0, span] : [from, to]);
+  const [rr0, rr1] = whole(r0, r1, layout.rows);
+  const [cc0, cc1] = whole(c0, c1, layout.cols);
+  return { r0: rr0, r1: rr1, c0: cc0, c1: cc1 };
+}
+
+/** 导出用：把（可能越界的）范围裁到 `0..cols` × `0..rows`。 */
+export function clampRangeToMap(layout: MapLayout, range: CellRange): CellRange {
+  return {
+    r0: clampInt(range.r0, 0, layout.rows),
+    c0: clampInt(range.c0, 0, layout.cols),
+    r1: clampInt(range.r1, 0, layout.rows),
+    c1: clampInt(range.c1, 0, layout.cols)
+  };
+}
